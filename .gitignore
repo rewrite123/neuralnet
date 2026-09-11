@@ -1,0 +1,8 @@
+/target
+/data/mnist/
+/models/
+*.optimizer.json
+/data/gpt2/
+/data/text/
+*.optimizer.bin
+cuda-keyring_*.deb

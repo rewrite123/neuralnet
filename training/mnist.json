@@ -1,0 +1,19 @@
+{
+  "name": "MNIST handwritten digit classifier",
+  "target_accuracy": 0.9999,
+  "max_epochs": 20000,
+  "use_cuda": true,
+  "batch_size": 512,
+  "loading_functions": [],
+  "training": {
+    "kind": "mnist",
+    "images_path": "data/mnist/train-images-idx3-ubyte.gz",
+    "labels_path": "data/mnist/train-labels-idx1-ubyte.gz"
+  },
+  "validation_samples": 10000,
+  "test": {
+    "kind": "mnist",
+    "images_path": "data/mnist/t10k-images-idx3-ubyte.gz",
+    "labels_path": "data/mnist/t10k-labels-idx1-ubyte.gz"
+  }
+}
