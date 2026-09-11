@@ -2,6 +2,7 @@
 #[cfg(feature = "gpu")]
 mod gpu;
 mod gguf;
+mod growth;
 mod model;
 mod safetensors;
 mod tokenizer;
@@ -57,6 +58,15 @@ enum Commands {
         #[arg(long, default_value_t = 0.0003)] learning_rate: f32,
         #[arg(long)] max_sequences: Option<usize>,
         #[arg(long, default_value_t = 64)] log_every: usize,
+        #[arg(long, default_value_t = 0.1)] validation_fraction: f32,
+        #[arg(long, value_enum)] growth: Option<growth::GrowthStrategy>,
+        #[arg(long, default_value_t = 256)] growth_max_units: usize,
+        #[arg(long, default_value_t = 0.30)] growth_trigger: f32,
+        #[arg(long, default_value_t = 2)] growth_patience: usize,
+        #[arg(long, default_value_t = 2.0)] growth_new_layer_ratio: f32,
+        #[arg(long, default_value_t = 4)] growth_max_blocks: usize,
+        #[arg(long, default_value_t = 3072)] growth_max_ff: usize,
+        #[arg(long, default_value_t = 3)] growth_interval: usize,
         #[arg(long)] cuda: bool,
     },
     /// Greedily continues a prompt with a transformer language model.
@@ -191,7 +201,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             save_to(&built, &output)?;
             println!("Created {} model at {}", architecture.label(), output.display());
         }
-        Commands::TrainText { model, output, text, vocab, merges, sequence, epochs, learning_rate, max_sequences, log_every, cuda } => {
+        Commands::TrainText { model, output, text, vocab, merges, sequence, epochs, learning_rate, max_sequences, log_every, validation_fraction, growth, growth_max_units, growth_trigger, growth_patience, growth_new_layer_ratio, growth_max_blocks, growth_max_ff, growth_interval, cuda } => {
             enable_cuda(cuda)?;
             let mut network = model::load_model(&model).map_err(io::Error::other)?;
             let tokenizer = tokenizer::Tokenizer::load(&vocab, &merges).map_err(io::Error::other)?;
@@ -201,24 +211,38 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut windows: Vec<(Vec<u32>, Vec<u32>)> = ids.windows(sequence + 1).step_by(sequence).map(|window| (window[..sequence].to_vec(), window[1..].to_vec())).collect();
             windows.shuffle(&mut rand::rng());
             if let Some(limit) = max_sequences { windows.truncate(limit); }
-            println!("Training on {} tokens in {} sequences of {sequence}", ids.len(), windows.len());
+            // Held out before any training so growth strategies are compared on unseen text; a
+            // bigger grown model would otherwise win simply by memorising more of the corpus.
+            let held_out = ((windows.len() as f32 * validation_fraction).round() as usize).clamp(1, windows.len().saturating_sub(1));
+            let validation = windows.split_off(windows.len() - held_out);
+            println!("Training on {} tokens: {} training sequences, {} held-out, {sequence} tokens each", ids.len(), windows.len(), validation.len());
+            let mut controller = growth.map(|strategy| growth::GrowthController::new(strategy, growth_max_units, growth_trigger, growth_patience, growth_new_layer_ratio, growth_max_blocks, growth_max_ff, growth_interval));
             let interrupted = Arc::new(AtomicBool::new(false));
             let signal_flag = Arc::clone(&interrupted);
             ctrlc::set_handler(move || { signal_flag.store(true, Ordering::Relaxed); }).map_err(io::Error::other)?;
             let started = std::time::Instant::now();
             let mut steps = 0usize;
             'training: for epoch in 1..=epochs {
-                // Chunked so a long epoch reports progress and checkpoints as it goes.
+                // Chunked so a long epoch reports progress and can grow as it goes.
                 for chunk in windows.chunks(log_every) {
                     let loss = network.train_language_model(chunk, 1, learning_rate, learn_functions::LearningFunction::AdamW { weight_decay: 0.01 }, &interrupted, |_, _| {}).map_err(io::Error::other)?;
                     steps += chunk.len();
+                    let (validation_loss, validation_accuracy) = evaluate_sequences(&network, &validation).map_err(io::Error::other)?;
                     let elapsed = started.elapsed().as_secs_f32();
-                    println!("epoch {epoch} step {steps}/{}: loss {loss:.4} (perplexity {:.1}) | {:.0} tokens/s | {:.1}m elapsed", windows.len() * epochs, loss.exp(), (steps * sequence) as f32 / elapsed, elapsed / 60.0);
+                    let parameters: usize = network.parameter_total();
+                    println!("epoch {epoch} step {steps}/{}: train {loss:.4} | val {validation_loss:.4} (ppl {:.1}, acc {:.1}%) | {parameters} params | {:.0} tok/s | {:.1}m", windows.len() * epochs, validation_loss.exp(), validation_accuracy * 100.0, (steps * sequence) as f32 / elapsed, elapsed / 60.0);
+                    if let Some(controller) = controller.as_mut() {
+                        if let Some(change) = controller.observe(&mut network, validation_accuracy, validation_loss).map_err(io::Error::other)? {
+                            println!("  growth: {change} -> {} params", network.parameter_total());
+                        }
+                    }
                     if interrupted.load(Ordering::Relaxed) { break 'training; }
                 }
             }
             let elapsed = started.elapsed().as_secs_f32();
+            let (validation_loss, validation_accuracy) = evaluate_sequences(&network, &validation).map_err(io::Error::other)?;
             println!("Trained {steps} sequence steps in {elapsed:.1}s");
+            println!("FINAL: val loss {validation_loss:.4} | perplexity {:.2} | accuracy {:.2}% | {} parameters", validation_loss.exp(), validation_accuracy * 100.0, network.parameter_total());
             let was_interrupted = interrupted.load(Ordering::Relaxed);
             let output = output.unwrap_or(model);
             if was_interrupted && !confirm_save(&output)? { println!("Discarded interrupted training changes."); return Ok(()); }
@@ -335,6 +359,21 @@ fn normalized_arguments() -> Vec<OsString> {
 
 fn normalize_arguments(arguments: Vec<OsString>) -> Vec<OsString> {
     arguments.into_iter().map(|argument| if argument == "--train" { OsString::from("train") } else { argument }).collect()
+}
+
+/// Mean next-token loss and accuracy over held-out sequences.
+fn evaluate_sequences(network: &model::Model, sequences: &[(Vec<u32>, Vec<u32>)]) -> Result<(f32, f32), String> {
+    if sequences.is_empty() { return Err("no held-out sequences".into()); }
+    let mut loss = 0.0;
+    let mut correct = 0usize;
+    let mut total = 0usize;
+    for (tokens, targets) in sequences {
+        let (sequence_loss, predictions) = network.language_model_evaluate(tokens, targets)?;
+        loss += sequence_loss;
+        correct += predictions;
+        total += targets.len();
+    }
+    Ok((loss / sequences.len() as f32, correct as f32 / total as f32))
 }
 
 fn enable_cuda(requested: bool) -> Result<(), Box<dyn Error>> {

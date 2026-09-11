@@ -656,6 +656,38 @@ impl Model {
         Ok(copied)
     }
 
+    /// Total number of trainable parameters.
+    pub fn parameter_total(&self) -> usize { self.parameter_sizes().iter().sum() }
+
+    /// Held-out loss and the number of positions whose highest-scoring token is correct.
+    pub fn language_model_evaluate(&self, tokens: &[u32], targets: &[u32]) -> Result<(f32, usize), String> {
+        if tokens.is_empty() || tokens.len() != targets.len() { return Err("token and target sequences must be equal and non-empty".into()); }
+        let input = Tensor::new(1, 1, tokens.len(), tokens.iter().map(|token| *token as f32).collect())?;
+        let logits = self.forward_cached(input)?.activations.pop().unwrap();
+        let vocabulary = logits.width;
+        let mut loss = 0.0;
+        let mut correct = 0;
+        for position in 0..tokens.len() {
+            let row = &logits.values[position * vocabulary..(position + 1) * vocabulary];
+            let target = targets[position] as usize;
+            if target >= vocabulary { return Err(format!("target token {target} is outside the vocabulary of {vocabulary}")); }
+            loss -= softmax(row.to_vec())[target].max(1e-9).ln();
+            if class(row) == target { correct += 1; }
+        }
+        Ok((loss / tokens.len() as f32, correct))
+    }
+
+    /// Logits at the final position, exposed for growth tests.
+    pub(crate) fn last_row_logits_for_test(&self, tokens: &[u32]) -> Result<Vec<f32>, String> { self.last_row_logits(tokens) }
+
+    /// Drops optimizer state and cached device buffers after the layer shapes change.
+    pub(crate) fn invalidate_after_growth(&mut self) {
+        invalidate_device_cache();
+        #[cfg(feature = "gpu")]
+        crate::gpu::clear_moment_buffers();
+        self.optimizer = None;
+    }
+
     /// Longest sequence the positional embedding can cover.
     pub fn max_sequence(&self) -> usize {
         self.layers.iter().find_map(|layer| match layer { Layer::PositionalEmbedding { max_sequence, .. } => Some(*max_sequence), _ => None }).unwrap_or(self.input_width)
