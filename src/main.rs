@@ -61,8 +61,10 @@ enum Commands {
         #[arg(long, default_value_t = 0.1)] validation_fraction: f32,
         #[arg(long, value_enum)] growth: Option<growth::GrowthStrategy>,
         #[arg(long, default_value_t = 256)] growth_max_units: usize,
-        #[arg(long, default_value_t = 0.30)] growth_trigger: f32,
+        #[arg(long, default_value_t = 0.01)] growth_trigger: f32,
         #[arg(long, default_value_t = 2)] growth_patience: usize,
+        #[arg(long, default_value_t = 0.20)] shrink_trigger: f32,
+        #[arg(long, default_value_t = 2)] shrink_patience: usize,
         #[arg(long, default_value_t = 2.0)] growth_new_layer_ratio: f32,
         #[arg(long, default_value_t = 4)] growth_max_blocks: usize,
         #[arg(long, default_value_t = 3072)] growth_max_ff: usize,
@@ -201,7 +203,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             save_to(&built, &output)?;
             println!("Created {} model at {}", architecture.label(), output.display());
         }
-        Commands::TrainText { model, output, text, vocab, merges, sequence, epochs, learning_rate, max_sequences, log_every, validation_fraction, growth, growth_max_units, growth_trigger, growth_patience, growth_new_layer_ratio, growth_max_blocks, growth_max_ff, growth_interval, cuda } => {
+        Commands::TrainText { model, output, text, vocab, merges, sequence, epochs, learning_rate, max_sequences, log_every, validation_fraction, growth, growth_max_units, growth_trigger, growth_patience, shrink_trigger, shrink_patience, growth_new_layer_ratio, growth_max_blocks, growth_max_ff, growth_interval, cuda } => {
             enable_cuda(cuda)?;
             let mut network = model::load_model(&model).map_err(io::Error::other)?;
             let tokenizer = tokenizer::Tokenizer::load(&vocab, &merges).map_err(io::Error::other)?;
@@ -216,7 +218,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let held_out = ((windows.len() as f32 * validation_fraction).round() as usize).clamp(1, windows.len().saturating_sub(1));
             let validation = windows.split_off(windows.len() - held_out);
             println!("Training on {} tokens: {} training sequences, {} held-out, {sequence} tokens each", ids.len(), windows.len(), validation.len());
-            let mut controller = growth.map(|strategy| growth::GrowthController::new(strategy, growth_max_units, growth_trigger, growth_patience, growth_new_layer_ratio, growth_max_blocks, growth_max_ff, growth_interval));
+            let mut controller = growth.map(|strategy| growth::GrowthController::new(strategy, growth_max_units, growth_trigger, growth_patience, shrink_trigger, shrink_patience, growth_new_layer_ratio, growth_max_blocks, growth_max_ff, growth_interval));
             let interrupted = Arc::new(AtomicBool::new(false));
             let signal_flag = Arc::clone(&interrupted);
             ctrlc::set_handler(move || { signal_flag.store(true, Ordering::Relaxed); }).map_err(io::Error::other)?;

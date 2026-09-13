@@ -114,6 +114,51 @@ fn new_unit_source(strategy: GrowthStrategy, existing: usize, unit: usize, rng: 
     }
 }
 
+/// Removes `extra` hidden units from a transformer block while preserving its function.
+///
+/// The shrink succeeds only when the trailing units have zero output projection weights. Those
+/// units make no contribution to the residual branch, so removing them is exactly function
+/// preserving rather than an arbitrary trained-neuron deletion.
+pub fn shrink_feed_forward(model: &mut Model, block_index: usize, extra: usize, strategy: GrowthStrategy) -> Result<(), String> {
+    if extra == 0 { return Ok(()); }
+    let Some(Layer::TransformerBlock { d_model, heads, ff_hidden, weights, biases }) = model.layers.get_mut(block_index) else {
+        return Err(format!("layer {block_index} is not a transformer block"));
+    };
+    let (d_model, heads) = (*d_model, *heads);
+    let old = BlockLayout::new(d_model, *ff_hidden);
+    let new_hidden = old.ff_hidden.saturating_sub(extra).max(2);
+    if new_hidden == 0 || new_hidden >= old.ff_hidden { return Ok(()); }
+    let new = BlockLayout::new(d_model, new_hidden);
+    let old_w1 = &weights[old.w1_start()..old.w2_start()];
+    let old_w2 = &weights[old.w2_start()..old.gamma_start()];
+    if old_w2.chunks_exact(old.ff_hidden).any(|row| row[new_hidden..].iter().any(|weight| *weight != 0.0)) {
+        return Ok(());
+    }
+    let mut shrunk_weights = vec![0.0; 4 * new.square + 2 * new.feed + 2 * d_model];
+    shrunk_weights[..old.w1_start()].copy_from_slice(&weights[..old.w1_start()]);
+    for row in 0..new_hidden {
+        let source = row * d_model;
+        let target = new.w1_start() + row * d_model;
+        shrunk_weights[target..target + d_model].copy_from_slice(&old_w1[source..source + d_model]);
+    }
+    for row in 0..d_model {
+        let target = new.w2_start() + row * new_hidden;
+        let source = row * old.ff_hidden;
+        shrunk_weights[target..target + new_hidden].copy_from_slice(&old_w2[source..source + new_hidden]);
+    }
+    shrunk_weights[new.gamma_start()..].copy_from_slice(&weights[old.gamma_start()..]);
+    let mut shrunk_biases = vec![0.0; new_hidden + 3 * d_model];
+    shrunk_biases[..new_hidden].copy_from_slice(&biases[..new_hidden]);
+    shrunk_biases[new_hidden..].copy_from_slice(&biases[old.ff_hidden..]);
+    *weights = shrunk_weights;
+    *biases = shrunk_biases;
+    *ff_hidden = new_hidden;
+    let _ = heads;
+    let _ = strategy;
+    model.invalidate_after_growth();
+    Ok(())
+}
+
 /// Inserts a transformer block after `after_index` that is exactly the identity.
 ///
 /// The attention output projection and the feed-forward output weights are zero, so both residual
@@ -242,10 +287,13 @@ pub struct GrowthController {
     max_units: usize,
     accuracy_trigger: f32,
     patience: usize,
+    shrink_trigger: f32,
+    shrink_patience: usize,
     new_layer_ratio: f32,
     max_blocks: usize,
     max_ff: usize,
     consecutive: usize,
+    shrink_consecutive: usize,
     best_loss: f32,
     checks: usize,
     interval: usize,
@@ -253,29 +301,49 @@ pub struct GrowthController {
 
 impl GrowthController {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(strategy: GrowthStrategy, max_units: usize, accuracy_trigger: f32, patience: usize, new_layer_ratio: f32, max_blocks: usize, max_ff: usize, interval: usize) -> Self {
-        Self { strategy, max_units, accuracy_trigger, patience, new_layer_ratio, max_blocks, max_ff, consecutive: 0, best_loss: f32::INFINITY, checks: 0, interval }
+    pub fn new(strategy: GrowthStrategy, max_units: usize, accuracy_trigger: f32, patience: usize, shrink_trigger: f32, shrink_patience: usize, new_layer_ratio: f32, max_blocks: usize, max_ff: usize, interval: usize) -> Self {
+        Self { strategy, max_units, accuracy_trigger, patience, shrink_trigger, shrink_patience, new_layer_ratio, max_blocks, max_ff, consecutive: 0, shrink_consecutive: 0, best_loss: f32::INFINITY, checks: 0, interval }
     }
 
-    /// Called after each validation measurement. Returns a description when the model grew.
+    /// Called after each validation measurement. Returns a description when the model changed.
     pub fn observe(&mut self, model: &mut Model, accuracy: f32, loss: f32) -> Result<Option<String>, String> {
         self.checks += 1;
-        let triggered = match self.strategy {
-            // Specification: grow once correctness has held above the trigger for enough checks.
+        let (triggered, should_shrink) = match self.strategy {
+            // ATGT: grow when accuracy stays high long enough, shrink when it falls below the target.
             GrowthStrategy::Atgt => {
                 if accuracy >= self.accuracy_trigger { self.consecutive += 1; } else { self.consecutive = 0; }
-                if self.consecutive >= self.patience { self.consecutive = 0; true } else { false }
+                if accuracy <= self.shrink_trigger { self.shrink_consecutive += 1; } else { self.shrink_consecutive = 0; }
+                let should_shrink = self.shrink_consecutive >= self.shrink_patience;
+                if should_shrink { self.shrink_consecutive = 0; }
+                if self.consecutive >= self.patience {
+                    self.consecutive = 0;
+                    (true, should_shrink)
+                } else {
+                    (false, should_shrink)
+                }
             }
             // Neurogenesis: add capacity when progress stalls, measured relatively so it still
             // fires late in training when absolute improvements are small.
             GrowthStrategy::Ang => {
                 let improved = loss < self.best_loss * 0.99;
                 if improved { self.best_loss = loss; self.consecutive = 0; } else { self.consecutive += 1; }
-                if self.consecutive >= self.patience { self.consecutive = 0; true } else { false }
+                if self.consecutive >= self.patience { self.consecutive = 0; (true, false) } else { (false, false) }
             }
             // MixtureGrowth: expand on a fixed cadence.
-            GrowthStrategy::Mixture => self.checks % self.interval == 0,
+            GrowthStrategy::Mixture => (self.checks % self.interval == 0, false),
         };
+        if should_shrink {
+            let signals = measure(model);
+            let chosen = signals.iter().max_by(|left, right| left.ff_hidden.cmp(&right.ff_hidden)).unwrap();
+            if chosen.ff_hidden > 64 {
+                shrink_feed_forward(model, chosen.index, 64, self.strategy)?;
+                let shrunk = measure(model).into_iter().find(|signal| signal.index == chosen.index).map_or(false, |signal| signal.ff_hidden < chosen.ff_hidden);
+                if shrunk {
+                    return Ok(Some(format!("shrunk block at layer {} by 64 neurons (acc {:.3}, loss {:.3})", chosen.index, accuracy, loss)));
+                }
+            }
+            return Ok(None);
+        }
         if !triggered { return Ok(None); }
 
         let signals = measure(model);
@@ -316,6 +384,20 @@ mod tests {
 
     fn logits(model: &Model, tokens: &[u32]) -> Vec<f32> {
         model.last_row_logits_for_test(tokens).unwrap()
+    }
+
+    #[test]
+    fn shrinking_a_feed_forward_block_preserves_the_function() {
+        let tokens = vec![3u32, 1, 4, 1, 5];
+        let mut model = Model::language_model(32, 16, 2, 32, 2, 8).unwrap();
+        grow_feed_forward(&mut model, 2, 4, GrowthStrategy::Atgt).unwrap();
+        let before = logits(&model, &tokens);
+        shrink_feed_forward(&mut model, 2, 4, GrowthStrategy::Atgt).unwrap();
+        let after = logits(&model, &tokens);
+        assert_eq!(before.len(), after.len());
+        for (before, after) in before.iter().zip(&after) {
+            assert!((before - after).abs() < 1e-4, "shrink changed the function: {before} vs {after}");
+        }
     }
 
     #[test]
