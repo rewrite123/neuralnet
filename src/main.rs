@@ -57,6 +57,8 @@ enum Commands {
         #[arg(long, default_value_t = 1)] epochs: usize,
         #[arg(long, default_value_t = 0.0003)] learning_rate: f32,
         #[arg(long, default_value_t = 1)] batch_size: usize,
+        /// Save an atomic checkpoint after this many validation chunks; zero disables periodic saves.
+        #[arg(long, default_value_t = 1)] checkpoint_every: usize,
         #[arg(long)] max_sequences: Option<usize>,
         #[arg(long, default_value_t = 64)] log_every: usize,
         #[arg(long, default_value_t = 0.1)] validation_fraction: f32,
@@ -206,9 +208,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             save_to(&built, &output)?;
             println!("Created {} model at {}", architecture.label(), output.display());
         }
-        Commands::TrainText { model, output, text, vocab, merges, sequence, epochs, learning_rate, batch_size, max_sequences, log_every, validation_fraction, growth, growth_max_units, growth_trigger, growth_patience, shrink_trigger, shrink_patience, growth_new_layer_ratio, growth_max_blocks, growth_max_ff, growth_interval, cuda } => {
+        Commands::TrainText { model, output, text, vocab, merges, sequence, epochs, learning_rate, batch_size, checkpoint_every, max_sequences, log_every, validation_fraction, growth, growth_max_units, growth_trigger, growth_patience, shrink_trigger, shrink_patience, growth_new_layer_ratio, growth_max_blocks, growth_max_ff, growth_interval, cuda } => {
             enable_cuda(cuda)?;
             let mut network = model::load_model(&model).map_err(io::Error::other)?;
+            let output = output.unwrap_or(model);
             let tokenizer = tokenizer::Tokenizer::load(&vocab, &merges).map_err(io::Error::other)?;
             let corpus = fs::read_to_string(&text)?;
             let ids = tokenizer.encode(&corpus).map_err(io::Error::other)?;
@@ -227,6 +230,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             ctrlc::set_handler(move || { signal_flag.store(true, Ordering::Relaxed); }).map_err(io::Error::other)?;
             let started = std::time::Instant::now();
             let mut steps = 0usize;
+            let mut checkpoint_count = 0usize;
             'training: for epoch in 1..=epochs {
                 // Chunked so a long epoch reports progress and can grow as it goes.
                 for chunk in windows.chunks(log_every) {
@@ -241,6 +245,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                             println!("  growth: {change} -> {} params", network.parameter_total());
                         }
                     }
+                    checkpoint_count += 1;
+                    if checkpoint_every > 0 && checkpoint_count % checkpoint_every == 0 {
+                        save_to(&network, &output)?;
+                        println!("Checkpoint saved to {}", output.display());
+                    }
                     if interrupted.load(Ordering::Relaxed) { break 'training; }
                 }
             }
@@ -249,10 +258,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("Trained {steps} sequence steps in {elapsed:.1}s");
             println!("FINAL: val loss {validation_loss:.4} | perplexity {:.2} | accuracy {:.2}% | {} parameters", validation_loss.exp(), validation_accuracy * 100.0, network.parameter_total());
             let was_interrupted = interrupted.load(Ordering::Relaxed);
-            let output = output.unwrap_or(model);
-            if was_interrupted && !confirm_save(&output)? { println!("Discarded interrupted training changes."); return Ok(()); }
             save_to(&network, &output)?;
-            println!("Saved language model to {}", output.display());
+            if was_interrupted { println!("Saved interrupted language model to {}", output.display()); } else { println!("Saved language model to {}", output.display()); }
         }
         Commands::Generate { model, prompt, tokens, vocab, merges, temperature, top_k, cuda } => {
             enable_cuda(cuda)?;
@@ -296,7 +303,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             let overrides = training::Overrides { epochs, batch_size, max_samples };
             let outcome = training::train_from_json(network, config.to_str().ok_or("config path is not UTF-8")?, learning_rate, rule, &interrupted, cuda, overrides).map_err(io::Error::other)?;
             let was_interrupted = outcome.was_interrupted();
-            if was_interrupted && !confirm_save(&output)? { println!("Discarded interrupted training changes."); return Ok(()); }
             save_to(&outcome.into_model(), &output)?;
             println!("Saved {}{} model to {}{}", if was_interrupted { "interrupted " } else { "trained " }, architecture.label(), output.display(), if cuda { " using CUDA" } else { "" });
         }
@@ -434,20 +440,6 @@ fn parse_neuron_indexes(value: &str) -> Result<Vec<usize>, String> {
     }
     if indexes.is_empty() { return Err("provide at least one neuron index".to_owned()); }
     Ok(indexes)
-}
-
-fn confirm_save(path: &PathBuf) -> Result<bool, io::Error> {
-    loop {
-        print!("Training interrupted. Save checkpoint to {}? [s]ave/[d]iscard: ", path.display());
-        io::stdout().flush()?;
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer)?;
-        match answer.trim().to_ascii_lowercase().as_str() {
-            "s" | "save" => return Ok(true),
-            "d" | "discard" => return Ok(false),
-            _ => eprintln!("Enter 's' to save or 'd' to discard."),
-        }
-    }
 }
 
 #[cfg(test)]

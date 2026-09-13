@@ -1011,6 +1011,11 @@ fn parameters(layers: &[Layer]) -> Vec<(usize, &Vec<f32>, &Vec<f32>)> {
 fn optimizer_path(path: &Path) -> PathBuf { PathBuf::from(format!("{}.optimizer.bin", path.display())) }
 fn legacy_optimizer_path(path: &Path) -> PathBuf { PathBuf::from(format!("{}.optimizer.json", path.display())) }
 
+fn temporary_path(path: &Path) -> PathBuf {
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("model");
+    path.with_file_name(format!(".{name}.partial"))
+}
+
 /// Moment buffers are far too large to store as JSON text, so they use a flat binary layout.
 fn encode_optimizer(state: &ModelOptimizer) -> Result<Vec<u8>, String> {
     let mut bytes = b"NNOPT1".to_vec();
@@ -1068,13 +1073,22 @@ pub fn save_model(model: &Model, path: &Path) -> Result<(), String> {
         gguf::f32s(&mut file, biases);
         file.resize(gguf::aligned(file.len()), 0);
     }
-    fs::write(path, file).map_err(|error| error.to_string())?;
+    let temporary_model = temporary_path(path);
+    fs::write(&temporary_model, file).map_err(|error| error.to_string())?;
     let checkpoint = optimizer_path(path);
     match &model.optimizer {
-        Some(state) => fs::write(&checkpoint, encode_optimizer(state)?).map_err(|error| error.to_string())?,
-        None if checkpoint.exists() => fs::remove_file(checkpoint).map_err(|error| error.to_string())?,
+        Some(state) => {
+            let temporary_optimizer = temporary_path(&checkpoint);
+            fs::write(&temporary_optimizer, encode_optimizer(state)?).map_err(|error| error.to_string())?;
+            if checkpoint.exists() { fs::remove_file(&checkpoint).map_err(|error| error.to_string())?; }
+            fs::rename(&temporary_model, path).map_err(|error| error.to_string())?;
+            fs::rename(temporary_optimizer, checkpoint).map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+        None if checkpoint.exists() => fs::remove_file(&checkpoint).map_err(|error| error.to_string())?,
         None => {}
     }
+    fs::rename(temporary_model, path).map_err(|error| error.to_string())?;
     Ok(())
 }
 
