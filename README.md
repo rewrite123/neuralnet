@@ -20,6 +20,14 @@ bash scripts/deploy_deeplearn.sh
 
 Set `DEEPLEARN_HOST` or `DEEPLEARN_ROOT` to override the remote host or checkout path, or pass a branch name as the sole argument. The script does not stop or restart an active training process.
 
+On `deeplearn`, start CUDA jobs through the runtime wrapper so the compatible user-local NVRTC library takes priority over the system CUDA 13.4 runtime:
+
+```bash
+bash scripts/run_cuda.sh train-text --cuda --model models/atgt-shakespeare-delta.gguf ...
+```
+
+The installed driver reports CUDA 13.0 support, while the system `nvcc` is CUDA 13.4; invoking `target/release/neuralnet` directly can therefore cause `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` and a CPU fallback in older binaries.
+
 ## Commands
 
 ### Create a model
