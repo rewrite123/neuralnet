@@ -710,6 +710,17 @@ impl Model {
     pub fn language_model_evaluate(&self, tokens: &[u32], targets: &[u32]) -> Result<(f32, usize), String> {
         if tokens.is_empty() || tokens.len() != targets.len() { return Err("token and target sequences must be equal and non-empty".into()); }
         let input = Tensor::new(1, 1, tokens.len(), tokens.iter().map(|token| *token as f32).collect())?;
+        #[cfg(feature = "gpu")]
+        if crate::gpu::enabled() {
+            let output_index = self.layers.len().saturating_sub(1);
+            if let Some(Layer::TimeDistributedDense { inputs, outputs, weights, biases }) = self.layers.last() {
+                let cache = self.forward_cached_through(input.clone(), output_index)?;
+                let hidden = cache.activations.last().unwrap();
+                if let Ok(metrics) = crate::gpu::time_distributed_evaluate_device(&hidden.values, weights, biases, targets, hidden.height, *outputs, *inputs) {
+                    return Ok(metrics);
+                }
+            }
+        }
         let logits = self.forward_cached(input)?.activations.pop().unwrap();
         let vocabulary = logits.width;
         let mut loss = 0.0;
@@ -1840,6 +1851,21 @@ mod tests {
         assert_eq!(optimizer.step, 10);
         let moment_energy: f32 = optimizer.second.iter().flatten().map(|value| value.abs()).sum();
         assert!(moment_energy > 0.0, "device moments were never flushed back to the host");
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn cuda_language_model_evaluation_matches_cpu() {
+        let model = Model::language_model(48, 64, 4, 128, 1, 16).unwrap();
+        let tokens: Vec<u32> = (0..12).map(|value| (value * 5 % 48) as u32).collect();
+        let targets: Vec<u32> = (0..12).map(|value| (value * 7 % 48) as u32).collect();
+        crate::gpu::set_enabled(false);
+        let cpu = model.language_model_evaluate(&tokens, &targets).unwrap();
+        crate::gpu::set_enabled(true);
+        let gpu = model.language_model_evaluate(&tokens, &targets).unwrap();
+        crate::gpu::set_enabled(false);
+        assert!((cpu.0 - gpu.0).abs() < 1e-5, "evaluation loss diverged: CPU {} GPU {}", cpu.0, gpu.0);
+        assert_eq!(cpu.1, gpu.1, "evaluation accuracy diverged");
     }
 
     #[test]

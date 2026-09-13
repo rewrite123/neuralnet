@@ -145,6 +145,19 @@ extern "C" __global__ void softmax_cross_entropy(const float* logits, const floa
     }
     losses[row] = -(input[target] - maximum - logf(total));
 }
+extern "C" __global__ void softmax_metrics(const float* logits, const float* targets, float* losses, float* correct, int rows, int columns) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x; if (row >= rows) return;
+    const float* input = logits + (size_t)row * columns;
+    float maximum = -3.402823466e+38f, total = 0.0f;
+    int prediction = 0;
+    for (int column = 0; column < columns; ++column) {
+        if (input[column] > maximum) { maximum = input[column]; prediction = column; }
+    }
+    for (int column = 0; column < columns; ++column) total += expf(input[column] - maximum);
+    int target = (int)targets[row];
+    losses[row] = -(input[target] - maximum - logf(total));
+    correct[row] = prediction == target ? 1.0f : 0.0f;
+}
 extern "C" __global__ void layer_norm_forward(const float* input, const float* gamma, const float* beta, float* out, float* hat, float* scale, int rows, int width) {
     int row = blockIdx.x * blockDim.x + threadIdx.x; if (row >= rows) return;
     const float* x = input + (size_t)row * width;
@@ -465,6 +478,32 @@ pub fn time_distributed_loss_backward_device(input: &[f32], weights: &[f32], bia
         launch_kernel!(&stream, &sum, columns, &logits_gradient, &mut bias_gradient, &rows_i32, &columns_i32)?;
         let mean_loss = stream.memcpy_dtov(&losses).map_err(|error| error.to_string())?.iter().sum::<f32>() / rows as f32;
         Ok((mean_loss, stream.memcpy_dtov(&input_gradient).map_err(|error| error.to_string())?, DeviceVector::new(weight_gradient, columns * inner), DeviceVector::new(bias_gradient, columns)))
+    })
+}
+
+/// Runs a language-model output projection and held-out softmax metrics on CUDA.
+pub fn time_distributed_evaluate_device(input: &[f32], weights: &[f32], biases: &[f32], targets: &[u32], rows: usize, columns: usize, inner: usize) -> Result<(f32, usize), String> {
+    if rows == 0 || columns == 0 || input.len() != rows * inner || weights.len() != columns * inner || biases.len() != columns || targets.len() != rows || targets.iter().any(|target| *target as usize >= columns) {
+        return Err("invalid CUDA language-model evaluation shape or target".into());
+    }
+    let (context, module) = cnn_runtime()?;
+    let stream = context.default_stream();
+    let matmul = module.load_function("matmul_nt").map_err(|error| error.to_string())?;
+    let metrics = module.load_function("softmax_metrics").map_err(|error| error.to_string())?;
+    let device_input = stream.memcpy_stod(input).map_err(|error| error.to_string())?;
+    let target_values: Vec<f32> = targets.iter().map(|target| *target as f32).collect();
+    let device_targets = stream.memcpy_stod(&target_values).map_err(|error| error.to_string())?;
+    let (rows_i32, columns_i32, inner_i32) = (rows as i32, columns as i32, inner as i32);
+    with_cached_pair(&stream, weights, biases, |device_weights, device_biases| {
+        let mut logits = stream.alloc_zeros::<f32>(rows * columns).map_err(|error| error.to_string())?;
+        let use_bias = 1i32;
+        launch_kernel!(&stream, &matmul, rows * columns, &device_input, device_weights, device_biases, &mut logits, &rows_i32, &columns_i32, &inner_i32, &use_bias)?;
+        let mut losses = stream.alloc_zeros::<f32>(rows).map_err(|error| error.to_string())?;
+        let mut correct = stream.alloc_zeros::<f32>(rows).map_err(|error| error.to_string())?;
+        launch_kernel!(&stream, &metrics, rows, &logits, &device_targets, &mut losses, &mut correct, &rows_i32, &columns_i32)?;
+        let mean_loss = stream.memcpy_dtov(&losses).map_err(|error| error.to_string())?.iter().sum::<f32>() / rows as f32;
+        let correct = stream.memcpy_dtov(&correct).map_err(|error| error.to_string())?.iter().sum::<f32>() as usize;
+        Ok((mean_loss, correct))
     })
 }
 
