@@ -49,7 +49,7 @@ if [[ "$status" -ne 0 ]]; then
     cat "$log" >&2
     exit "$status"
 fi
-if ! awk -F, -v pid="$pid" '$1 ~ "^" pid " " { found=1 } END { exit !found }' "$gpu_profile"; then
+if ! awk -F, -v pid="$pid" '$1 ~ "^[[:space:]]*" pid "[[:space:]]*$" { found=1 } END { exit !found }' "$gpu_profile"; then
     echo "CUDA test failed: training PID $pid never appeared in nvidia-smi." >&2
     echo "GPU profile: $gpu_profile" >&2
     exit 1
