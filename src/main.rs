@@ -13,7 +13,7 @@ mod data;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use rand::seq::SliceRandom;
-use std::{error::Error, ffi::OsString, fs, io::{self, Write}, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, Ordering}, Arc}};
+use std::{error::Error, ffi::OsString, fs, io, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, Ordering}, Arc}};
 
 #[derive(Parser)]
 #[command(name = "neuralnet", about = "Create, train, and inspect dense neural-network models.")]
