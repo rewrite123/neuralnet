@@ -192,15 +192,17 @@ extern "C" __global__ void gelu_backward(const float* pre, const float* gradient
 extern "C" __global__ void add_vectors(const float* left, const float* right, float* out, int size) {
     int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < size) out[i] = left[i] + right[i];
 }
-extern "C" __global__ void attention_forward(const float* q, const float* k, const float* v, float* probs, float* context, int sequence, int d_model, int head_dim, float scale) {
+extern "C" __global__ void attention_forward(const float* q, const float* k, const float* v, float* probs, float* context, int batch, int sequence, int d_model, int head_dim, float scale) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int heads = d_model / head_dim; if (index >= heads * sequence) return;
-    int head = index / sequence, query = index % sequence, off = head * head_dim;
-    float* p = probs + (size_t)(head * sequence + query) * sequence;
+    int heads = d_model / head_dim; if (index >= batch * heads * sequence) return;
+    int sequence_index = index % (heads * sequence), sample = index / (heads * sequence);
+    int head = sequence_index / sequence, query = sequence_index % sequence, off = head * head_dim;
+    size_t sample_offset = (size_t)sample * sequence * d_model;
+    float* p = probs + (size_t)(sample * heads * sequence + head * sequence + query) * sequence;
     float maximum = -3.402823466e+38f;
     for (int key = 0; key <= query; ++key) {
         float sum = 0.0f;
-        for (int i = 0; i < head_dim; ++i) sum += q[(size_t)query * d_model + off + i] * k[(size_t)key * d_model + off + i];
+        for (int i = 0; i < head_dim; ++i) sum += q[sample_offset + (size_t)query * d_model + off + i] * k[sample_offset + (size_t)key * d_model + off + i];
         p[key] = sum * scale; maximum = fmaxf(maximum, p[key]);
     }
     float total = 0.0f;
@@ -208,39 +210,43 @@ extern "C" __global__ void attention_forward(const float* q, const float* k, con
     for (int key = 0; key <= query; ++key) p[key] /= total;
     for (int i = 0; i < head_dim; ++i) {
         float sum = 0.0f;
-        for (int key = 0; key <= query; ++key) sum += p[key] * v[(size_t)key * d_model + off + i];
-        context[(size_t)query * d_model + off + i] = sum;
+        for (int key = 0; key <= query; ++key) sum += p[key] * v[sample_offset + (size_t)key * d_model + off + i];
+        context[sample_offset + (size_t)query * d_model + off + i] = sum;
     }
 }
-extern "C" __global__ void attention_value_gradient(const float* probs, const float* v, const float* context_gradient, float* probability_gradient, float* v_gradient, int sequence, int d_model, int head_dim) {
+extern "C" __global__ void attention_value_gradient(const float* probs, const float* v, const float* context_gradient, float* probability_gradient, float* v_gradient, int batch, int sequence, int d_model, int head_dim) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int heads = d_model / head_dim; if (index >= heads * sequence) return;
-    int head = index / sequence, query = index % sequence, off = head * head_dim;
-    const float* p = probs + (size_t)(head * sequence + query) * sequence;
-    float* g = probability_gradient + (size_t)(head * sequence + query) * sequence;
-    const float* cg = context_gradient + (size_t)query * d_model + off;
+    int heads = d_model / head_dim; if (index >= batch * heads * sequence) return;
+    int sequence_index = index % (heads * sequence), sample = index / (heads * sequence);
+    int head = sequence_index / sequence, query = sequence_index % sequence, off = head * head_dim;
+    size_t sample_offset = (size_t)sample * sequence * d_model;
+    const float* p = probs + (size_t)(sample * heads * sequence + head * sequence + query) * sequence;
+    float* g = probability_gradient + (size_t)(sample * heads * sequence + head * sequence + query) * sequence;
+    const float* cg = context_gradient + sample_offset + (size_t)query * d_model + off;
     for (int key = 0; key <= query; ++key) {
         float sum = 0.0f;
         for (int i = 0; i < head_dim; ++i) {
-            sum += cg[i] * v[(size_t)key * d_model + off + i];
-            atomicAdd(&v_gradient[(size_t)key * d_model + off + i], p[key] * cg[i]);
+            sum += cg[i] * v[sample_offset + (size_t)key * d_model + off + i];
+            atomicAdd(&v_gradient[sample_offset + (size_t)key * d_model + off + i], p[key] * cg[i]);
         }
         g[key] = sum;
     }
 }
-extern "C" __global__ void attention_score_gradient(const float* probs, const float* probability_gradient, const float* q, const float* k, float* q_gradient, float* k_gradient, int sequence, int d_model, int head_dim, float scale) {
+extern "C" __global__ void attention_score_gradient(const float* probs, const float* probability_gradient, const float* q, const float* k, float* q_gradient, float* k_gradient, int batch, int sequence, int d_model, int head_dim, float scale) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int heads = d_model / head_dim; if (index >= heads * sequence) return;
-    int head = index / sequence, query = index % sequence, off = head * head_dim;
-    const float* p = probs + (size_t)(head * sequence + query) * sequence;
-    const float* g = probability_gradient + (size_t)(head * sequence + query) * sequence;
+    int heads = d_model / head_dim; if (index >= batch * heads * sequence) return;
+    int sequence_index = index % (heads * sequence), sample = index / (heads * sequence);
+    int head = sequence_index / sequence, query = sequence_index % sequence, off = head * head_dim;
+    size_t sample_offset = (size_t)sample * sequence * d_model;
+    const float* p = probs + (size_t)(sample * heads * sequence + head * sequence + query) * sequence;
+    const float* g = probability_gradient + (size_t)(sample * heads * sequence + head * sequence + query) * sequence;
     float weighted = 0.0f;
     for (int key = 0; key <= query; ++key) weighted += p[key] * g[key];
     for (int key = 0; key <= query; ++key) {
         float ds = p[key] * (g[key] - weighted) * scale;
         for (int i = 0; i < head_dim; ++i) {
-            q_gradient[(size_t)query * d_model + off + i] += ds * k[(size_t)key * d_model + off + i];
-            atomicAdd(&k_gradient[(size_t)key * d_model + off + i], ds * q[(size_t)query * d_model + off + i]);
+            q_gradient[sample_offset + (size_t)query * d_model + off + i] += ds * k[sample_offset + (size_t)key * d_model + off + i];
+            atomicAdd(&k_gradient[sample_offset + (size_t)key * d_model + off + i], ds * q[sample_offset + (size_t)query * d_model + off + i]);
         }
     }
 }
@@ -512,9 +518,12 @@ struct BlockContext<'a> {
     stream: Arc<CudaStream>,
     module: Arc<CudaModule>,
     shape: &'a crate::transformer::BlockShape,
+    batch: usize,
 }
 
 impl BlockContext<'_> {
+    fn rows(&self) -> usize { self.batch * self.shape.sequence }
+
     fn function(&self, name: &str) -> Result<cudarc::driver::CudaFunction, String> {
         self.module.load_function(name).map_err(|error| error.to_string())
     }
@@ -548,7 +557,7 @@ impl BlockContext<'_> {
 
     fn layer_norm(&self, input: &CudaSlice<f32>, gamma: &CudaSlice<f32>, beta: &CudaSlice<f32>) -> Result<(CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>), String> {
         let function = self.function("layer_norm_forward")?;
-        let (rows, width) = (self.shape.sequence, self.shape.d_model);
+        let (rows, width) = (self.rows(), self.shape.d_model);
         let mut output = self.zeros(rows * width)?;
         let mut hat = self.zeros(rows * width)?;
         let mut scale = self.zeros(rows)?;
@@ -559,7 +568,7 @@ impl BlockContext<'_> {
 
     fn layer_norm_backward(&self, gradient: &CudaSlice<f32>, hat: &CudaSlice<f32>, scale: &CudaSlice<f32>, gamma: &CudaSlice<f32>) -> Result<(CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>), String> {
         let function = self.function("layer_norm_backward")?;
-        let (rows, width) = (self.shape.sequence, self.shape.d_model);
+        let (rows, width) = (self.rows(), self.shape.d_model);
         let mut input_gradient = self.zeros(rows * width)?;
         let mut gamma_gradient = self.zeros(width)?;
         let mut beta_gradient = self.zeros(width)?;
@@ -578,29 +587,29 @@ impl BlockContext<'_> {
 
     fn attention(&self, queries: &CudaSlice<f32>, keys: &CudaSlice<f32>, values: &CudaSlice<f32>) -> Result<(CudaSlice<f32>, CudaSlice<f32>), String> {
         let function = self.function("attention_forward")?;
-        let (sequence, d_model, heads) = (self.shape.sequence, self.shape.d_model, self.shape.heads);
+        let (batch, sequence, d_model, heads) = (self.batch, self.shape.sequence, self.shape.d_model, self.shape.heads);
         let head_dim = self.shape.head_dim();
-        let mut probabilities = self.zeros(heads * sequence * sequence)?;
-        let mut context = self.zeros(sequence * d_model)?;
-        let (sequence_i32, d_model_i32, head_dim_i32) = (sequence as i32, d_model as i32, head_dim as i32);
+        let mut probabilities = self.zeros(batch * heads * sequence * sequence)?;
+        let mut context = self.zeros(batch * sequence * d_model)?;
+        let (batch_i32, sequence_i32, d_model_i32, head_dim_i32) = (batch as i32, sequence as i32, d_model as i32, head_dim as i32);
         let scale = 1.0f32 / (head_dim as f32).sqrt();
-        launch_kernel!(&self.stream, &function, heads * sequence, queries, keys, values, &mut probabilities, &mut context, &sequence_i32, &d_model_i32, &head_dim_i32, &scale)?;
+        launch_kernel!(&self.stream, &function, batch * heads * sequence, queries, keys, values, &mut probabilities, &mut context, &batch_i32, &sequence_i32, &d_model_i32, &head_dim_i32, &scale)?;
         Ok((probabilities, context))
     }
 
     fn attention_backward(&self, probabilities: &CudaSlice<f32>, queries: &CudaSlice<f32>, keys: &CudaSlice<f32>, values: &CudaSlice<f32>, context_gradient: &CudaSlice<f32>) -> Result<(CudaSlice<f32>, CudaSlice<f32>, CudaSlice<f32>), String> {
         let value_kernel = self.function("attention_value_gradient")?;
         let score_kernel = self.function("attention_score_gradient")?;
-        let (sequence, d_model, heads) = (self.shape.sequence, self.shape.d_model, self.shape.heads);
+        let (batch, sequence, d_model, heads) = (self.batch, self.shape.sequence, self.shape.d_model, self.shape.heads);
         let head_dim = self.shape.head_dim();
-        let mut probability_gradient = self.zeros(heads * sequence * sequence)?;
-        let mut value_gradient = self.zeros(sequence * d_model)?;
-        let mut query_gradient = self.zeros(sequence * d_model)?;
-        let mut key_gradient = self.zeros(sequence * d_model)?;
-        let (sequence_i32, d_model_i32, head_dim_i32) = (sequence as i32, d_model as i32, head_dim as i32);
+        let mut probability_gradient = self.zeros(batch * heads * sequence * sequence)?;
+        let mut value_gradient = self.zeros(batch * sequence * d_model)?;
+        let mut query_gradient = self.zeros(batch * sequence * d_model)?;
+        let mut key_gradient = self.zeros(batch * sequence * d_model)?;
+        let (batch_i32, sequence_i32, d_model_i32, head_dim_i32) = (batch as i32, sequence as i32, d_model as i32, head_dim as i32);
         let scale = 1.0f32 / (head_dim as f32).sqrt();
-        launch_kernel!(&self.stream, &value_kernel, heads * sequence, probabilities, values, context_gradient, &mut probability_gradient, &mut value_gradient, &sequence_i32, &d_model_i32, &head_dim_i32)?;
-        launch_kernel!(&self.stream, &score_kernel, heads * sequence, probabilities, &probability_gradient, queries, keys, &mut query_gradient, &mut key_gradient, &sequence_i32, &d_model_i32, &head_dim_i32, &scale)?;
+        launch_kernel!(&self.stream, &value_kernel, batch * heads * sequence, probabilities, values, context_gradient, &mut probability_gradient, &mut value_gradient, &batch_i32, &sequence_i32, &d_model_i32, &head_dim_i32)?;
+        launch_kernel!(&self.stream, &score_kernel, batch * heads * sequence, probabilities, &probability_gradient, queries, keys, &mut query_gradient, &mut key_gradient, &batch_i32, &sequence_i32, &d_model_i32, &head_dim_i32, &scale)?;
         Ok((query_gradient, key_gradient, value_gradient))
     }
 
@@ -655,28 +664,34 @@ struct BlockActivations {
 /// Runs the whole block on the device; only `input` is uploaded.
 fn run_block_forward(context: &BlockContext, input: &CudaSlice<f32>, parameters: &[&CudaSlice<f32>]) -> Result<BlockActivations, String> {
     let shape = context.shape;
-    let (sequence, d_model, ff_hidden) = (shape.sequence, shape.d_model, shape.ff_hidden);
+    let (rows, d_model, ff_hidden) = (context.rows(), shape.d_model, shape.ff_hidden);
     let [wq, wk, wv, wo, w1, w2, ln1_gamma, ln2_gamma, b1, b2, ln1_beta, ln2_beta] = parameters else { return Err("transformer block expects twelve parameter buffers".into()) };
 
     let (normalized_one, hat_one, scale_one) = context.layer_norm(input, ln1_gamma, ln1_beta)?;
-    let queries = context.matmul(&normalized_one, wq, None, sequence, d_model, d_model)?;
-    let keys = context.matmul(&normalized_one, wk, None, sequence, d_model, d_model)?;
-    let values = context.matmul(&normalized_one, wv, None, sequence, d_model, d_model)?;
+    let queries = context.matmul(&normalized_one, wq, None, rows, d_model, d_model)?;
+    let keys = context.matmul(&normalized_one, wk, None, rows, d_model, d_model)?;
+    let values = context.matmul(&normalized_one, wv, None, rows, d_model, d_model)?;
     let (probabilities, attention_context) = context.attention(&queries, &keys, &values)?;
-    let attention = context.matmul(&attention_context, wo, None, sequence, d_model, d_model)?;
-    let residual_one = context.add(input, &attention, sequence * d_model)?;
+    let attention = context.matmul(&attention_context, wo, None, rows, d_model, d_model)?;
+    let residual_one = context.add(input, &attention, rows * d_model)?;
     let (normalized_two, hat_two, scale_two) = context.layer_norm(&residual_one, ln2_gamma, ln2_beta)?;
-    let hidden_pre = context.matmul(&normalized_two, w1, Some(b1), sequence, ff_hidden, d_model)?;
-    let hidden = context.gelu(&hidden_pre, sequence * ff_hidden)?;
-    let feed = context.matmul(&hidden, w2, Some(b2), sequence, d_model, ff_hidden)?;
-    let output = context.add(&residual_one, &feed, sequence * d_model)?;
+    let hidden_pre = context.matmul(&normalized_two, w1, Some(b1), rows, ff_hidden, d_model)?;
+    let hidden = context.gelu(&hidden_pre, rows * ff_hidden)?;
+    let feed = context.matmul(&hidden, w2, Some(b2), rows, d_model, ff_hidden)?;
+    let output = context.add(&residual_one, &feed, rows * d_model)?;
 
     Ok(BlockActivations { normalized_one, hat_one, scale_one, queries, keys, values, probabilities, context: attention_context, residual_one, normalized_two, hat_two, scale_two, hidden_pre, hidden, output })
 }
 
 pub fn transformer_block_forward(input: &[f32], shape: &crate::transformer::BlockShape, weights: &[f32], biases: &[f32]) -> Result<Vec<f32>, String> {
+    transformer_block_forward_batched(input, shape, weights, biases, 1)
+}
+
+/// Runs independent fixed-length sequences through a transformer block in one CUDA launch set.
+pub fn transformer_block_forward_batched(input: &[f32], shape: &crate::transformer::BlockShape, weights: &[f32], biases: &[f32], batch: usize) -> Result<Vec<f32>, String> {
+    if batch == 0 || input.len() != batch * shape.sequence * shape.d_model { return Err("invalid CUDA transformer batch shape".into()); }
     let (cuda, module) = cnn_runtime()?;
-    let context = BlockContext { stream: cuda.default_stream(), module, shape };
+    let context = BlockContext { stream: cuda.default_stream(), module, shape, batch };
     let device_input = context.stream.memcpy_stod(input).map_err(|error| error.to_string())?;
     let slices = shape.parameter_slices(weights, biases);
     with_cached_many(&context.stream, &slices, |parameters| {
@@ -687,7 +702,7 @@ pub fn transformer_block_forward(input: &[f32], shape: &crate::transformer::Bloc
 
 pub fn transformer_block_backward(input: &[f32], gradient: &[f32], shape: &crate::transformer::BlockShape, weights: &[f32], biases: &[f32]) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
     let (cuda, module) = cnn_runtime()?;
-    let context = BlockContext { stream: cuda.default_stream(), module, shape };
+    let context = BlockContext { stream: cuda.default_stream(), module, shape, batch: 1 };
     let (sequence, d_model, ff_hidden) = (shape.sequence, shape.d_model, shape.ff_hidden);
     let device_input = context.stream.memcpy_stod(input).map_err(|error| error.to_string())?;
     let device_gradient = context.stream.memcpy_stod(gradient).map_err(|error| error.to_string())?;
@@ -746,9 +761,15 @@ fn concatenate(stream: &Arc<CudaStream>, module: &Arc<CudaModule>, parts: &[&Cud
 
 /// Backward pass that leaves the packed weight and bias gradients on the device.
 pub fn transformer_block_backward_device(input: &[f32], gradient: &[f32], shape: &crate::transformer::BlockShape, weights: &[f32], biases: &[f32]) -> Result<(Vec<f32>, DeviceVector, DeviceVector), String> {
+    transformer_block_backward_device_batched(input, gradient, shape, weights, biases, 1)
+}
+
+/// Backpropagates independent fixed-length sequences through one transformer block together.
+pub fn transformer_block_backward_device_batched(input: &[f32], gradient: &[f32], shape: &crate::transformer::BlockShape, weights: &[f32], biases: &[f32], batch: usize) -> Result<(Vec<f32>, DeviceVector, DeviceVector), String> {
+    if batch == 0 || input.len() != batch * shape.sequence * shape.d_model || gradient.len() != input.len() { return Err("invalid CUDA transformer gradient batch shape".into()); }
     let (cuda, module) = cnn_runtime()?;
-    let context = BlockContext { stream: cuda.default_stream(), module: module.clone(), shape };
-    let (sequence, d_model, ff_hidden) = (shape.sequence, shape.d_model, shape.ff_hidden);
+    let context = BlockContext { stream: cuda.default_stream(), module: module.clone(), shape, batch };
+    let (rows, d_model, ff_hidden) = (context.rows(), shape.d_model, shape.ff_hidden);
     let device_input = context.stream.memcpy_stod(input).map_err(|error| error.to_string())?;
     let device_gradient = context.stream.memcpy_stod(gradient).map_err(|error| error.to_string())?;
     let slices = shape.parameter_slices(weights, biases);
@@ -756,23 +777,23 @@ pub fn transformer_block_backward_device(input: &[f32], gradient: &[f32], shape:
         let [wq, wk, wv, wo, w1, w2, ln1_gamma, ln2_gamma, ..] = parameters else { return Err("transformer block expects twelve parameter buffers".into()) };
         let saved = run_block_forward(&context, &device_input, parameters)?;
 
-        let bias_two_gradient = context.column_sum(&device_gradient, sequence, d_model)?;
-        let (hidden_gradient, w2_gradient) = context.matmul_backward(&device_gradient, &saved.hidden, w2, sequence, d_model, ff_hidden)?;
-        let pre_gradient = context.gelu_backward(&saved.hidden_pre, &hidden_gradient, sequence * ff_hidden)?;
-        let bias_one_gradient = context.column_sum(&pre_gradient, sequence, ff_hidden)?;
-        let (normalized_two_gradient, w1_gradient) = context.matmul_backward(&pre_gradient, &saved.normalized_two, w1, sequence, ff_hidden, d_model)?;
+        let bias_two_gradient = context.column_sum(&device_gradient, rows, d_model)?;
+        let (hidden_gradient, w2_gradient) = context.matmul_backward(&device_gradient, &saved.hidden, w2, rows, d_model, ff_hidden)?;
+        let pre_gradient = context.gelu_backward(&saved.hidden_pre, &hidden_gradient, rows * ff_hidden)?;
+        let bias_one_gradient = context.column_sum(&pre_gradient, rows, ff_hidden)?;
+        let (normalized_two_gradient, w1_gradient) = context.matmul_backward(&pre_gradient, &saved.normalized_two, w1, rows, ff_hidden, d_model)?;
         let (residual_from_feed, ln2_gamma_gradient, ln2_beta_gradient) = context.layer_norm_backward(&normalized_two_gradient, &saved.hat_two, &saved.scale_two, ln2_gamma)?;
-        let residual_gradient = context.add(&device_gradient, &residual_from_feed, sequence * d_model)?;
+        let residual_gradient = context.add(&device_gradient, &residual_from_feed, rows * d_model)?;
 
-        let (context_gradient, wo_gradient) = context.matmul_backward(&residual_gradient, &saved.context, wo, sequence, d_model, d_model)?;
+        let (context_gradient, wo_gradient) = context.matmul_backward(&residual_gradient, &saved.context, wo, rows, d_model, d_model)?;
         let (query_gradient, key_gradient, value_gradient) = context.attention_backward(&saved.probabilities, &saved.queries, &saved.keys, &saved.values, &context_gradient)?;
-        let (from_queries, wq_gradient) = context.matmul_backward(&query_gradient, &saved.normalized_one, wq, sequence, d_model, d_model)?;
-        let (from_keys, wk_gradient) = context.matmul_backward(&key_gradient, &saved.normalized_one, wk, sequence, d_model, d_model)?;
-        let (from_values, wv_gradient) = context.matmul_backward(&value_gradient, &saved.normalized_one, wv, sequence, d_model, d_model)?;
-        let projected = context.add(&from_queries, &from_keys, sequence * d_model)?;
-        let projected = context.add(&projected, &from_values, sequence * d_model)?;
+        let (from_queries, wq_gradient) = context.matmul_backward(&query_gradient, &saved.normalized_one, wq, rows, d_model, d_model)?;
+        let (from_keys, wk_gradient) = context.matmul_backward(&key_gradient, &saved.normalized_one, wk, rows, d_model, d_model)?;
+        let (from_values, wv_gradient) = context.matmul_backward(&value_gradient, &saved.normalized_one, wv, rows, d_model, d_model)?;
+        let projected = context.add(&from_queries, &from_keys, rows * d_model)?;
+        let projected = context.add(&projected, &from_values, rows * d_model)?;
         let (from_attention, ln1_gamma_gradient, ln1_beta_gradient) = context.layer_norm_backward(&projected, &saved.hat_one, &saved.scale_one, ln1_gamma)?;
-        let input_gradient = context.add(&residual_gradient, &from_attention, sequence * d_model)?;
+        let input_gradient = context.add(&residual_gradient, &from_attention, rows * d_model)?;
 
         let square = d_model * d_model;
         let feed = ff_hidden * d_model;

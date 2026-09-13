@@ -591,6 +591,15 @@ impl Model {
             if interrupted.load(Ordering::Relaxed) { break; }
             let mut total = 0.0;
             for batch in sequences.chunks(batch_size) {
+                #[cfg(feature = "gpu")]
+                if crate::gpu::enabled() && batch.len() > 1 {
+                    if let Ok((loss, gradients)) = self.language_model_batch_step_cuda(batch) {
+                        total += loss * batch.len() as f32;
+                        optimizer.step += 1;
+                        self.apply_gradients(&gradients, learning_rate, &mut optimizer);
+                        continue;
+                    }
+                }
                 let mut gradients: Option<Vec<Option<LayerGradient>>> = None;
                 for (tokens, targets) in batch {
                     let (loss, sample) = self.language_model_step(tokens, targets)?;
@@ -608,6 +617,76 @@ impl Model {
         self.flush_device_state(&mut optimizer);
         self.optimizer = Some(optimizer);
         Ok(last)
+    }
+
+    #[cfg(feature = "gpu")]
+    fn language_model_batch_step_cuda(&self, sequences: &[(Vec<u32>, Vec<u32>)]) -> Result<(f32, Vec<Option<LayerGradient>>), String> {
+        let batch = sequences.len();
+        let sequence = sequences.first().ok_or("empty language-model batch")?.0.len();
+        if batch < 2 || sequence == 0 || sequences.iter().any(|(tokens, targets)| tokens.len() != sequence || targets.len() != sequence) {
+            return Err("CUDA language-model batches require equal non-empty sequence lengths".into());
+        }
+        let Layer::Embedding { vocab, d_model, weights: embedding_weights, .. } = &self.layers[0] else { return Err("CUDA batch path requires a token embedding".into()) };
+        let Layer::PositionalEmbedding { max_sequence, weights: position_weights, .. } = &self.layers[1] else { return Err("CUDA batch path requires positional embeddings".into()) };
+        if sequence > *max_sequence { return Err("sequence exceeds positional embedding length".into()); }
+        let output_index = self.layers.len().checked_sub(1).ok_or("empty model")?;
+        let norm_index = output_index.checked_sub(1).ok_or("CUDA batch path requires a final layer norm")?;
+        let Layer::LayerNorm { size, weights: norm_weights, biases: norm_biases } = &self.layers[norm_index] else { return Err("CUDA batch path requires a final layer norm".into()) };
+        let Layer::TimeDistributedDense { inputs, outputs, weights: output_weights, biases: output_biases } = &self.layers[output_index] else { return Err("CUDA batch path requires a time-distributed output head".into()) };
+        if *d_model != *size || *size != *inputs { return Err("CUDA batch path has inconsistent model widths".into()); }
+
+        let tokens: Vec<f32> = sequences.iter().flat_map(|(tokens, _)| tokens.iter().map(|token| *token as f32)).collect();
+        let targets: Vec<u32> = sequences.iter().flat_map(|(_, targets)| targets.iter().copied()).collect();
+        let mut activations = Vec::with_capacity(self.layers.len());
+        activations.push(tokens.clone());
+        let mut values = crate::gpu::embedding_gather(&tokens, embedding_weights, *d_model)?;
+        activations.push(values.clone());
+        for sample in 0..batch {
+            for position in 0..sequence {
+                let output = (sample * sequence + position) * d_model;
+                let source = position * d_model;
+                for column in 0..*d_model { values[output + column] += position_weights[source + column]; }
+            }
+        }
+        activations.push(values.clone());
+
+        for layer in self.layers[2..norm_index].iter() {
+            let Layer::TransformerBlock { d_model: block_width, heads, ff_hidden, weights, biases } = layer else { return Err("CUDA batch path requires contiguous transformer blocks".into()) };
+            if block_width != d_model { return Err("CUDA batch transformer width mismatch".into()); }
+            let shape = crate::transformer::BlockShape { sequence, d_model: *block_width, heads: *heads, ff_hidden: *ff_hidden };
+            values = crate::gpu::transformer_block_forward_batched(&values, &shape, weights, biases, batch)?;
+            activations.push(values.clone());
+        }
+
+        let (normalized, hats, scales) = crate::transformer::layer_norm(&values, batch * sequence, *size, norm_weights, norm_biases);
+        activations.push(normalized.clone());
+        let (loss, mut gradient, output_weight_gradient, output_bias_gradient) = crate::gpu::time_distributed_loss_backward_device(&normalized, output_weights, output_biases, &targets, batch * sequence, *outputs, *inputs)?;
+        let mut gradients: Vec<Option<LayerGradient>> = self.layers.iter().map(|_| None).collect();
+        gradients[output_index] = Some(LayerGradient { weights: GradientData::Device(output_weight_gradient), biases: GradientData::Device(output_bias_gradient) });
+        let mut norm_weight_gradient = vec![0.0; *size];
+        let mut norm_bias_gradient = vec![0.0; *size];
+        gradient = crate::transformer::layer_norm_backward(&gradient, &hats, &scales, batch * sequence, *size, norm_weights, &mut norm_weight_gradient, &mut norm_bias_gradient);
+        gradients[norm_index] = Some(LayerGradient { weights: norm_weight_gradient.into(), biases: norm_bias_gradient.into() });
+
+        for index in (2..norm_index).rev() {
+            let Layer::TransformerBlock { d_model, heads, ff_hidden, weights, biases } = &self.layers[index] else { unreachable!() };
+            let shape = crate::transformer::BlockShape { sequence, d_model: *d_model, heads: *heads, ff_hidden: *ff_hidden };
+            let (input_gradient, weight_gradient, bias_gradient) = crate::gpu::transformer_block_backward_device_batched(&activations[index], &gradient, &shape, weights, biases, batch)?;
+            gradients[index] = Some(LayerGradient { weights: GradientData::Device(weight_gradient), biases: GradientData::Device(bias_gradient) });
+            gradient = input_gradient;
+        }
+
+        let mut position_gradient = vec![0.0; position_weights.len()];
+        for sample in 0..batch {
+            for position in 0..sequence {
+                let source = (sample * sequence + position) * d_model;
+                let target = position * d_model;
+                for column in 0..*d_model { position_gradient[target + column] += gradient[source + column]; }
+            }
+        }
+        gradients[1] = Some(LayerGradient { weights: position_gradient.into(), biases: Vec::new().into() });
+        gradients[0] = Some(LayerGradient { weights: GradientData::Device(crate::gpu::embedding_gradient(&tokens, &gradient, *vocab, *d_model)?), biases: Vec::new().into() });
+        Ok((loss, gradients))
     }
 
     /// Logits for the final position only.
@@ -1866,6 +1945,46 @@ mod tests {
         crate::gpu::set_enabled(false);
         assert!((cpu.0 - gpu.0).abs() < 1e-5, "evaluation loss diverged: CPU {} GPU {}", cpu.0, gpu.0);
         assert_eq!(cpu.1, gpu.1, "evaluation accuracy diverged");
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn batched_cuda_transformer_step_matches_cpu_loss() {
+        let model = Model::language_model(48, 64, 4, 128, 1, 16).unwrap();
+        let first_tokens: Vec<u32> = (0..12).map(|value| (value * 5 % 48) as u32).collect();
+        let first_targets: Vec<u32> = (0..12).map(|value| (value * 7 % 48) as u32).collect();
+        let second_tokens: Vec<u32> = (0..12).map(|value| (value * 11 % 48) as u32).collect();
+        let second_targets: Vec<u32> = (0..12).map(|value| (value * 13 % 48) as u32).collect();
+        let sequences = vec![(first_tokens.clone(), first_targets.clone()), (second_tokens.clone(), second_targets.clone())];
+        crate::gpu::set_enabled(false);
+        let expected = (model.language_model_step(&first_tokens, &first_targets).unwrap().0 + model.language_model_step(&second_tokens, &second_targets).unwrap().0) / 2.0;
+        crate::gpu::set_enabled(true);
+        let actual = model.language_model_batch_step_cuda(&sequences).unwrap().0;
+        crate::gpu::set_enabled(false);
+        assert!((expected - actual).abs() < 1e-5, "batched CUDA loss diverged: CPU {expected} GPU {actual}");
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn batched_cuda_transformer_update_tracks_cpu() {
+        let base = Model::language_model(48, 64, 4, 128, 1, 16).unwrap();
+        let first_tokens: Vec<u32> = (0..12).map(|value| (value * 5 % 48) as u32).collect();
+        let first_targets: Vec<u32> = (0..12).map(|value| (value * 7 % 48) as u32).collect();
+        let second_tokens: Vec<u32> = (0..12).map(|value| (value * 11 % 48) as u32).collect();
+        let second_targets: Vec<u32> = (0..12).map(|value| (value * 13 % 48) as u32).collect();
+        let sequences = vec![(first_tokens.clone(), first_targets.clone()), (second_tokens, second_targets)];
+        let interrupted = AtomicBool::new(false);
+        let rule = LearningFunction::AdamW { weight_decay: 0.01 };
+        let mut cpu = base.clone();
+        let mut gpu = base;
+        crate::gpu::set_enabled(false);
+        cpu.train_language_model_batched(&sequences, 1, 2, 0.01, rule, &interrupted, |_, _| {}).unwrap();
+        crate::gpu::set_enabled(true);
+        gpu.train_language_model_batched(&sequences, 1, 2, 0.01, rule, &interrupted, |_, _| {}).unwrap();
+        crate::gpu::set_enabled(false);
+        let cpu_loss = cpu.language_model_step(&first_tokens, &first_targets).unwrap().0;
+        let gpu_loss = gpu.language_model_step(&first_tokens, &first_targets).unwrap().0;
+        assert!((cpu_loss - gpu_loss).abs() < 5e-3, "batched CUDA update diverged: CPU {cpu_loss} GPU {gpu_loss}");
     }
 
     #[test]
