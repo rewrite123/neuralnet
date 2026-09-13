@@ -5,7 +5,7 @@ pub struct DenseLayer { pub weights: Vec<f32>, pub biases: Vec<f32> }
 
 pub struct Gradient { pub weights: Vec<Vec<f32>>, pub biases: Vec<Vec<f32>> }
 use cudarc::{driver::{CudaContext, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg}, nvrtc::compile_ptx};
-use std::{cell::RefCell, collections::HashMap, process::Command, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, env, process::Command, sync::Arc};
 
 const TRAINING_KERNELS: &str = r#"
 extern "C" __global__ void forward(const float* x, const float* w, const float* b, float* out, int batch, int input, int output, int relu) {
@@ -1062,7 +1062,9 @@ pub fn batch_gradient(sizes: &[usize], layers: &[DenseLayer], inputs: &[Vec<f32>
 
 fn ensure_nvrtc_available() -> Result<(), String> {
     let output = Command::new("ldconfig").arg("-p").output().map_err(|error| format!("checking CUDA runtime libraries: {error}"))?;
-    if String::from_utf8_lossy(&output.stdout).contains("libnvrtc.so") { Ok(()) } else { Err("CUDA training requires libnvrtc.so from the CUDA Toolkit. Install a CUDA Toolkit version compatible with the NVIDIA driver, then make its lib64 directory discoverable through LD_LIBRARY_PATH or ldconfig.".into()) }
+    let in_linker_cache = String::from_utf8_lossy(&output.stdout).contains("libnvrtc.so");
+    let in_library_path = env::var_os("LD_LIBRARY_PATH").is_some_and(|paths| env::split_paths(&paths).any(|path| path.join("libnvrtc.so").is_file()));
+    if in_linker_cache || in_library_path { Ok(()) } else { Err("CUDA training requires libnvrtc.so from the CUDA Toolkit. Install a CUDA Toolkit version compatible with the NVIDIA driver, then make its lib64 directory discoverable through LD_LIBRARY_PATH or ldconfig.".into()) }
 }
 
 #[cfg(test)]
