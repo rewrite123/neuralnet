@@ -814,6 +814,53 @@ impl Model {
         Ok((loss / tokens.len() as f32, correct))
     }
 
+    /// Mean held-out loss and correct-token count for equal-length sequences.
+    ///
+    /// CUDA evaluates the transformer and output head over the entire batch, avoiding a separate
+    /// host/device submission for every validation sequence.
+    pub fn language_model_evaluate_batched(&self, sequences: &[(Vec<u32>, Vec<u32>)]) -> Result<(f32, usize), String> {
+        let batch = sequences.len();
+        let sequence = sequences.first().ok_or("no held-out sequences")?.0.len();
+        if sequence == 0 || sequences.iter().any(|(tokens, targets)| tokens.len() != sequence || targets.len() != sequence) {
+            return Err("held-out sequences must be non-empty and have equal lengths".into());
+        }
+        #[cfg(feature = "gpu")]
+        if crate::gpu::enabled() {
+            let Layer::Embedding { d_model, weights: embedding_weights, .. } = &self.layers[0] else { return Err("CUDA evaluation requires a token embedding".into()) };
+            let Layer::PositionalEmbedding { max_sequence, weights: position_weights, .. } = &self.layers[1] else { return Err("CUDA evaluation requires positional embeddings".into()) };
+            let output_index = self.layers.len().checked_sub(1).ok_or("empty model")?;
+            let norm_index = output_index.checked_sub(1).ok_or("CUDA evaluation requires a final layer norm")?;
+            let Layer::LayerNorm { size, weights: norm_weights, biases: norm_biases } = &self.layers[norm_index] else { return Err("CUDA evaluation requires a final layer norm".into()) };
+            let Layer::TimeDistributedDense { inputs, outputs, weights: output_weights, biases: output_biases } = &self.layers[output_index] else { return Err("CUDA evaluation requires an output head".into()) };
+            if sequence > *max_sequence || *d_model != *size || *size != *inputs { return Err("CUDA evaluation has inconsistent model dimensions".into()); }
+            let tokens: Vec<f32> = sequences.iter().flat_map(|(tokens, _)| tokens.iter().map(|token| *token as f32)).collect();
+            let targets: Vec<u32> = sequences.iter().flat_map(|(_, targets)| targets.iter().copied()).collect();
+            let mut values = crate::gpu::embedding_gather(&tokens, embedding_weights, *d_model)?;
+            for sample in 0..batch {
+                for position in 0..sequence {
+                    let output = (sample * sequence + position) * d_model;
+                    let source = position * d_model;
+                    for column in 0..*d_model { values[output + column] += position_weights[source + column]; }
+                }
+            }
+            for layer in self.layers[2..norm_index].iter() {
+                let Layer::TransformerBlock { d_model: block_width, heads, ff_hidden, weights, biases } = layer else { return Err("CUDA evaluation requires contiguous transformer blocks".into()) };
+                let shape = crate::transformer::BlockShape { sequence, d_model: *block_width, heads: *heads, ff_hidden: *ff_hidden };
+                values = crate::gpu::transformer_block_forward_batched(&values, &shape, weights, biases, batch)?;
+            }
+            let (normalized, _, _) = crate::transformer::layer_norm(&values, batch * sequence, *size, norm_weights, norm_biases);
+            return crate::gpu::time_distributed_evaluate_device(&normalized, output_weights, output_biases, &targets, batch * sequence, *outputs, *inputs);
+        }
+        let mut loss = 0.0;
+        let mut correct = 0usize;
+        for (tokens, targets) in sequences {
+            let (sequence_loss, sequence_correct) = self.language_model_evaluate(tokens, targets)?;
+            loss += sequence_loss;
+            correct += sequence_correct;
+        }
+        Ok((loss / batch as f32, correct))
+    }
+
     /// Logits at the final position, exposed for growth tests.
     pub(crate) fn last_row_logits_for_test(&self, tokens: &[u32]) -> Result<Vec<f32>, String> { self.last_row_logits(tokens) }
 
@@ -1945,6 +1992,25 @@ mod tests {
         crate::gpu::set_enabled(false);
         assert!((cpu.0 - gpu.0).abs() < 1e-5, "evaluation loss diverged: CPU {} GPU {}", cpu.0, gpu.0);
         assert_eq!(cpu.1, gpu.1, "evaluation accuracy diverged");
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn batched_cuda_language_model_evaluation_matches_cpu() {
+        let model = Model::language_model(48, 64, 4, 128, 1, 16).unwrap();
+        let first_tokens: Vec<u32> = (0..12).map(|value| (value * 5 % 48) as u32).collect();
+        let first_targets: Vec<u32> = (0..12).map(|value| (value * 7 % 48) as u32).collect();
+        let second_tokens: Vec<u32> = (0..12).map(|value| (value * 11 % 48) as u32).collect();
+        let second_targets: Vec<u32> = (0..12).map(|value| (value * 13 % 48) as u32).collect();
+        let sequences = vec![(first_tokens.clone(), first_targets.clone()), (second_tokens.clone(), second_targets.clone())];
+        crate::gpu::set_enabled(false);
+        let first = model.language_model_evaluate(&first_tokens, &first_targets).unwrap();
+        let second = model.language_model_evaluate(&second_tokens, &second_targets).unwrap();
+        crate::gpu::set_enabled(true);
+        let batched = model.language_model_evaluate_batched(&sequences).unwrap();
+        crate::gpu::set_enabled(false);
+        assert!((((first.0 + second.0) / 2.0) - batched.0).abs() < 1e-5, "batched evaluation loss diverged");
+        assert_eq!(first.1 + second.1, batched.1, "batched evaluation accuracy diverged");
     }
 
     #[cfg(feature = "gpu")]

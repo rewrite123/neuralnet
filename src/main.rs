@@ -236,7 +236,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 for chunk in windows.chunks(log_every) {
                     let loss = network.train_language_model_batched(chunk, 1, batch_size, learning_rate, learn_functions::LearningFunction::AdamW { weight_decay: 0.01 }, &interrupted, |_, _| {}).map_err(io::Error::other)?;
                     steps += chunk.len();
-                    let (validation_loss, validation_accuracy) = evaluate_sequences(&network, &validation).map_err(io::Error::other)?;
+                    let (validation_loss, validation_accuracy) = evaluate_sequences(&network, &validation, batch_size).map_err(io::Error::other)?;
                     let elapsed = started.elapsed().as_secs_f32();
                     let parameters: usize = network.parameter_total();
                     println!("epoch {epoch} step {steps}/{}: train {loss:.4} | val {validation_loss:.4} (ppl {:.1}, acc {:.1}%) | {parameters} params | {:.0} tok/s | {:.1}m", windows.len() * epochs, validation_loss.exp(), validation_accuracy * 100.0, (steps * sequence) as f32 / elapsed, elapsed / 60.0);
@@ -254,7 +254,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             let elapsed = started.elapsed().as_secs_f32();
-            let (validation_loss, validation_accuracy) = evaluate_sequences(&network, &validation).map_err(io::Error::other)?;
+            let (validation_loss, validation_accuracy) = evaluate_sequences(&network, &validation, batch_size).map_err(io::Error::other)?;
             println!("Trained {steps} sequence steps in {elapsed:.1}s");
             println!("FINAL: val loss {validation_loss:.4} | perplexity {:.2} | accuracy {:.2}% | {} parameters", validation_loss.exp(), validation_accuracy * 100.0, network.parameter_total());
             let was_interrupted = interrupted.load(Ordering::Relaxed);
@@ -373,16 +373,16 @@ fn normalize_arguments(arguments: Vec<OsString>) -> Vec<OsString> {
 }
 
 /// Mean next-token loss and accuracy over held-out sequences.
-fn evaluate_sequences(network: &model::Model, sequences: &[(Vec<u32>, Vec<u32>)]) -> Result<(f32, f32), String> {
-    if sequences.is_empty() { return Err("no held-out sequences".into()); }
+fn evaluate_sequences(network: &model::Model, sequences: &[(Vec<u32>, Vec<u32>)], batch_size: usize) -> Result<(f32, f32), String> {
+    if sequences.is_empty() || batch_size == 0 { return Err("held-out sequences and batch size must be non-zero".into()); }
     let mut loss = 0.0;
     let mut correct = 0usize;
     let mut total = 0usize;
-    for (tokens, targets) in sequences {
-        let (sequence_loss, predictions) = network.language_model_evaluate(tokens, targets)?;
-        loss += sequence_loss;
-        correct += predictions;
-        total += targets.len();
+    for batch in sequences.chunks(batch_size) {
+        let (batch_loss, batch_correct) = network.language_model_evaluate_batched(batch)?;
+        loss += batch_loss * batch.len() as f32;
+        correct += batch_correct;
+        total += batch.iter().map(|(_, targets)| targets.len()).sum::<usize>();
     }
     Ok((loss / sequences.len() as f32, correct as f32 / total as f32))
 }
