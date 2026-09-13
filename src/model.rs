@@ -309,10 +309,14 @@ impl Model {
     }
 
     fn forward_cached(&self, input: Tensor) -> Result<ForwardCache, String> {
+        self.forward_cached_through(input, self.layers.len())
+    }
+
+    fn forward_cached_through(&self, input: Tensor, layer_count: usize) -> Result<ForwardCache, String> {
         let mut activations = vec![input];
         let mut bank: Vec<f32> = Vec::new();
         let mut bank_lengths = vec![0];
-        for layer in &self.layers {
+        for layer in self.layers.iter().take(layer_count) {
             let tensor = activations.last().unwrap();
             let next = match layer {
                 Layer::Conv2d { in_channels, out_channels, kernel_size, weights, biases } => conv2d(tensor, *in_channels, *out_channels, *kernel_size, weights, biases)?,
@@ -481,6 +485,22 @@ impl Model {
     pub fn language_model_step(&self, tokens: &[u32], targets: &[u32]) -> Result<(f32, Vec<Option<LayerGradient>>), String> {
         if tokens.is_empty() || tokens.len() != targets.len() { return Err("token and target sequences must be equal and non-empty".into()); }
         let input = Tensor::new(1, 1, tokens.len(), tokens.iter().map(|token| *token as f32).collect())?;
+
+        #[cfg(feature = "gpu")]
+        if crate::gpu::enabled() {
+            let output_index = self.layers.len().saturating_sub(1);
+            if let Some(Layer::TimeDistributedDense { inputs, outputs, weights, biases }) = self.layers.last() {
+                let cache = self.forward_cached_through(input.clone(), output_index)?;
+                let hidden = cache.activations.last().unwrap();
+                if let Ok((loss, input_gradient, weight_gradient, bias_gradient)) = crate::gpu::time_distributed_loss_backward_device(&hidden.values, weights, biases, targets, hidden.height, *outputs, *inputs) {
+                    let gradient = Tensor::new(1, hidden.height, hidden.width, input_gradient)?;
+                    let mut gradients = self.backward_traversal_through(&cache, gradient, output_index)?;
+                    gradients[output_index] = Some(LayerGradient { weights: GradientData::Device(weight_gradient), biases: GradientData::Device(bias_gradient) });
+                    return Ok((loss, gradients));
+                }
+            }
+        }
+
         let cache = self.forward_cached(input)?;
         let logits = cache.activations.last().unwrap();
         let vocabulary = logits.width;
@@ -511,9 +531,13 @@ impl Model {
     }
 
     fn backward_traversal(&self, cache: &ForwardCache, mut gradient: Tensor) -> Result<Vec<Option<LayerGradient>>, String> {
+        self.backward_traversal_through(cache, gradient, self.layers.len())
+    }
+
+    fn backward_traversal_through(&self, cache: &ForwardCache, mut gradient: Tensor, layer_count: usize) -> Result<Vec<Option<LayerGradient>>, String> {
         let mut gradients: Vec<Option<LayerGradient>> = self.layers.iter().map(|_| None).collect();
-        let mut bank_gradient = vec![0.0; *cache.bank_lengths.last().unwrap()];
-        for index in (0..self.layers.len()).rev() {
+        let mut bank_gradient = vec![0.0; cache.bank_lengths[layer_count]];
+        for index in (0..layer_count).rev() {
             let input = &cache.activations[index];
             gradient = match &self.layers[index] {
                 Layer::Dense { outputs, weights, .. } => { let (next, weight, bias) = dense_backward(input, *outputs, weights, &gradient)?; gradients[index] = Some(LayerGradient { weights: weight.into(), biases: bias.into() }); next }

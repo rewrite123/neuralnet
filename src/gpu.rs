@@ -431,6 +431,43 @@ pub fn softmax_cross_entropy(logits: &[f32], targets: &[u32], rows: usize, colum
     Ok((mean_loss, stream.memcpy_dtov(&gradient).map_err(|error| error.to_string())?))
 }
 
+/// Runs the output projection, softmax cross-entropy, and output-head backward pass on CUDA.
+///
+/// Logits and their vocabulary-sized gradient remain on the device; only the hidden-state
+/// gradient needed by the preceding layer is copied back to the host.
+pub fn time_distributed_loss_backward_device(input: &[f32], weights: &[f32], biases: &[f32], targets: &[u32], rows: usize, columns: usize, inner: usize) -> Result<(f32, Vec<f32>, DeviceVector, DeviceVector), String> {
+    if rows == 0 || columns == 0 || input.len() != rows * inner || weights.len() != columns * inner || biases.len() != columns || targets.len() != rows || targets.iter().any(|target| *target as usize >= columns) {
+        return Err("invalid CUDA language-model output shape or target".into());
+    }
+    let (context, module) = cnn_runtime()?;
+    let stream = context.default_stream();
+    let matmul = module.load_function("matmul_nt").map_err(|error| error.to_string())?;
+    let loss_kernel = module.load_function("softmax_cross_entropy").map_err(|error| error.to_string())?;
+    let left_gradient = module.load_function("matmul_nt_left_gradient").map_err(|error| error.to_string())?;
+    let right_gradient = module.load_function("matmul_nt_right_gradient").map_err(|error| error.to_string())?;
+    let sum = module.load_function("column_sum").map_err(|error| error.to_string())?;
+    let device_input = stream.memcpy_stod(input).map_err(|error| error.to_string())?;
+    let target_values: Vec<f32> = targets.iter().map(|target| *target as f32).collect();
+    let device_targets = stream.memcpy_stod(&target_values).map_err(|error| error.to_string())?;
+    let (rows_i32, columns_i32, inner_i32) = (rows as i32, columns as i32, inner as i32);
+    with_cached_pair(&stream, weights, biases, |device_weights, device_biases| {
+        let mut logits = stream.alloc_zeros::<f32>(rows * columns).map_err(|error| error.to_string())?;
+        let use_bias = 1i32;
+        launch_kernel!(&stream, &matmul, rows * columns, &device_input, device_weights, device_biases, &mut logits, &rows_i32, &columns_i32, &inner_i32, &use_bias)?;
+        let mut logits_gradient = stream.alloc_zeros::<f32>(rows * columns).map_err(|error| error.to_string())?;
+        let mut losses = stream.alloc_zeros::<f32>(rows).map_err(|error| error.to_string())?;
+        launch_kernel!(&stream, &loss_kernel, rows, &logits, &device_targets, &mut logits_gradient, &mut losses, &rows_i32, &columns_i32)?;
+        let mut input_gradient = stream.alloc_zeros::<f32>(rows * inner).map_err(|error| error.to_string())?;
+        let mut weight_gradient = stream.alloc_zeros::<f32>(columns * inner).map_err(|error| error.to_string())?;
+        let mut bias_gradient = stream.alloc_zeros::<f32>(columns).map_err(|error| error.to_string())?;
+        launch_kernel!(&stream, &left_gradient, rows * inner, &logits_gradient, device_weights, &mut input_gradient, &rows_i32, &columns_i32, &inner_i32)?;
+        launch_kernel!(&stream, &right_gradient, columns * inner, &logits_gradient, &device_input, &mut weight_gradient, &rows_i32, &columns_i32, &inner_i32)?;
+        launch_kernel!(&stream, &sum, columns, &logits_gradient, &mut bias_gradient, &rows_i32, &columns_i32)?;
+        let mean_loss = stream.memcpy_dtov(&losses).map_err(|error| error.to_string())?.iter().sum::<f32>() / rows as f32;
+        Ok((mean_loss, stream.memcpy_dtov(&input_gradient).map_err(|error| error.to_string())?, DeviceVector::new(weight_gradient, columns * inner), DeviceVector::new(bias_gradient, columns)))
+    })
+}
+
 /// Everything a transformer block needs while it stays on the device.
 struct BlockContext<'a> {
     stream: Arc<CudaStream>,
