@@ -28,6 +28,16 @@ bash scripts/run_cuda.sh train-text --cuda --model models/atgt-shakespeare-delta
 
 The installed driver reports CUDA 13.0 support, while the system `nvcc` is CUDA 13.4; invoking `target/release/neuralnet` directly can therefore cause `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` and a CPU fallback in older binaries.
 
+### Profile CUDA Training
+
+On `deeplearn`, run the arithmetic integration test to confirm that a real training process obtains a CUDA compute context while capturing CPU and GPU samples:
+
+```bash
+bash scripts/profile_cuda_math.sh
+```
+
+It creates a small `128`-wide transformer, trains it on generated arithmetic sentences, samples its PID with `top` and `nvidia-smi`, and fails when that PID never appears in NVIDIA's compute-process table. The test writes its model, corpus, training log, and profile captures under `models/` and `runs/`.
+
 ## Commands
 
 ### Create a model
