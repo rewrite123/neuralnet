@@ -48,8 +48,8 @@ impl Tokenizer {
         let mut pieces = Vec::new();
         let mut at = 0;
         while at < characters.len() {
-            let remaining: String = characters[at..].iter().collect();
-            if let Some(contraction) = CONTRACTIONS.iter().find(|candidate| remaining.starts_with(**candidate)) {
+            let matches_at = |candidate: &str| candidate.chars().enumerate().all(|(offset, character)| characters.get(at + offset) == Some(&character));
+            if let Some(contraction) = CONTRACTIONS.iter().find(|candidate| matches_at(candidate)) {
                 pieces.push((*contraction).to_string());
                 at += contraction.chars().count();
                 continue;
