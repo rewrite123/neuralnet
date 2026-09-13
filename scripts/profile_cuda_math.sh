@@ -35,7 +35,7 @@ pid=$!
 
 nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits --loop-ms=200 > "$gpu_profile" 2>&1 &
 gpu_sampler=$!
-top -b -d 1 -n 120 -p "$pid" > "$cpu_profile" 2>&1 &
+top -b -w 512 -d 1 -n 120 -p "$pid" > "$cpu_profile" 2>&1 &
 cpu_sampler=$!
 
 set +e
@@ -52,6 +52,11 @@ fi
 if ! awk -F, -v pid="$pid" '$1 ~ "^[[:space:]]*" pid "[[:space:]]*$" { found=1 } END { exit !found }' "$gpu_profile"; then
     echo "CUDA test failed: training PID $pid never appeared in nvidia-smi." >&2
     echo "GPU profile: $gpu_profile" >&2
+    exit 1
+fi
+if ! awk -v pid="$pid" '$1 == pid { found=1 } END { exit !found }' "$cpu_profile"; then
+    echo "CPU profiler failed: training PID $pid was not sampled by top." >&2
+    echo "CPU profile: $cpu_profile" >&2
     exit 1
 fi
 
