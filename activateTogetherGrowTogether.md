@@ -6,8 +6,8 @@ An example growthTriggerThreshhold might be 0.01, or, 1%.
 
 Using the methods above, I think we can let our model grow itself to an optimized size if we start out small.
 
-shrinkTriggerThreshhold: The threshhold for the % of correctness the model needs to be below to trigger a shrink
-shrinkEpochThrshhold: The number of epochs we have to stay under shrinkTriggerThreshhold to trigger a shrink
+shrinkTriggerThreshhold: The minimum change in held-out correctness between validation checks. ATGT counts a plateau or decline when the change is at or below this value; it does not shrink merely because cumulative correctness is low.
+shrinkEpochThrshhold: The number of consecutive validation checks whose correctness change stays at or below shrinkTriggerThreshhold before ATGT attempts a shrink
 growthTriggerThreshhold: The threshhold for the % of correctness the model needs to trigger a growth
 growthEpochThrshhold: The number of epochs we have to stay over growthTriggerThreshhold to trigger a growth
 checkpoint: The last value of the weights we had after a growth

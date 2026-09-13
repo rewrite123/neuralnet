@@ -294,6 +294,7 @@ pub struct GrowthController {
     max_ff: usize,
     consecutive: usize,
     shrink_consecutive: usize,
+    previous_accuracy: Option<f32>,
     best_loss: f32,
     checks: usize,
     interval: usize,
@@ -302,17 +303,24 @@ pub struct GrowthController {
 impl GrowthController {
     #[allow(clippy::too_many_arguments)]
     pub fn new(strategy: GrowthStrategy, max_units: usize, accuracy_trigger: f32, patience: usize, shrink_trigger: f32, shrink_patience: usize, new_layer_ratio: f32, max_blocks: usize, max_ff: usize, interval: usize) -> Self {
-        Self { strategy, max_units, accuracy_trigger, patience, shrink_trigger, shrink_patience, new_layer_ratio, max_blocks, max_ff, consecutive: 0, shrink_consecutive: 0, best_loss: f32::INFINITY, checks: 0, interval }
+        Self { strategy, max_units, accuracy_trigger, patience, shrink_trigger, shrink_patience, new_layer_ratio, max_blocks, max_ff, consecutive: 0, shrink_consecutive: 0, previous_accuracy: None, best_loss: f32::INFINITY, checks: 0, interval }
     }
 
     /// Called after each validation measurement. Returns a description when the model changed.
     pub fn observe(&mut self, model: &mut Model, accuracy: f32, loss: f32) -> Result<Option<String>, String> {
         self.checks += 1;
         let (triggered, should_shrink) = match self.strategy {
-            // ATGT: grow when accuracy stays high long enough, shrink when it falls below the target.
+            // ATGT: grow when accuracy stays high long enough and shrink after a sustained
+            // validation-accuracy plateau or decline, never because accuracy is merely low.
             GrowthStrategy::Atgt => {
                 if accuracy >= self.accuracy_trigger { self.consecutive += 1; } else { self.consecutive = 0; }
-                if accuracy <= self.shrink_trigger { self.shrink_consecutive += 1; } else { self.shrink_consecutive = 0; }
+                let accuracy_delta = self.previous_accuracy.map(|previous| accuracy - previous);
+                self.previous_accuracy = Some(accuracy);
+                if accuracy_delta.is_some_and(|delta| delta <= self.shrink_trigger) {
+                    self.shrink_consecutive += 1;
+                } else {
+                    self.shrink_consecutive = 0;
+                }
                 let should_shrink = self.shrink_consecutive >= self.shrink_patience;
                 if should_shrink { self.shrink_consecutive = 0; }
                 if self.consecutive >= self.patience {
@@ -339,7 +347,7 @@ impl GrowthController {
                 shrink_feed_forward(model, chosen.index, 64, self.strategy)?;
                 let shrunk = measure(model).into_iter().find(|signal| signal.index == chosen.index).map_or(false, |signal| signal.ff_hidden < chosen.ff_hidden);
                 if shrunk {
-                    return Ok(Some(format!("shrunk block at layer {} by 64 neurons (acc {:.3}, loss {:.3})", chosen.index, accuracy, loss)));
+                    return Ok(Some(format!("shrunk block at layer {} by 64 neurons after {} validation checks below {:.4} accuracy improvement (acc {:.3}, loss {:.3})", chosen.index, self.shrink_patience, self.shrink_trigger, accuracy, loss)));
                 }
             }
             return Ok(None);
@@ -398,6 +406,20 @@ mod tests {
         for (before, after) in before.iter().zip(&after) {
             assert!((before - after).abs() < 1e-4, "shrink changed the function: {before} vs {after}");
         }
+    }
+
+    #[test]
+    fn atgt_shrinks_after_a_sustained_accuracy_plateau() {
+        let mut model = Model::language_model(32, 16, 2, 32, 1, 8).unwrap();
+        grow_feed_forward(&mut model, 2, 64, GrowthStrategy::Atgt).unwrap();
+        let mut controller = GrowthController::new(GrowthStrategy::Atgt, 16, 2.0, 1, 0.001, 3, 2.0, 4, 128, 3);
+        assert!(controller.observe(&mut model, 0.50, 1.0).unwrap().is_none());
+        assert!(controller.observe(&mut model, 0.5005, 1.0).unwrap().is_none());
+        assert!(controller.observe(&mut model, 0.5010, 1.0).unwrap().is_none());
+        let change = controller.observe(&mut model, 0.5015, 1.0).unwrap();
+        assert!(change.is_some());
+        let Layer::TransformerBlock { ff_hidden, .. } = &model.layers[2] else { panic!() };
+        assert_eq!(*ff_hidden, 32);
     }
 
     #[test]

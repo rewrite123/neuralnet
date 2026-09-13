@@ -64,8 +64,10 @@ enum Commands {
         #[arg(long, default_value_t = 256)] growth_max_units: usize,
         #[arg(long, default_value_t = 0.01)] growth_trigger: f32,
         #[arg(long, default_value_t = 2)] growth_patience: usize,
-        #[arg(long, default_value_t = 0.20)] shrink_trigger: f32,
-        #[arg(long, default_value_t = 2)] shrink_patience: usize,
+        /// Minimum validation-accuracy improvement required between checks before ATGT counts a plateau.
+        #[arg(long, default_value_t = 0.001)] shrink_trigger: f32,
+        /// Number of consecutive validation plateaus or declines required before ATGT attempts to shrink.
+        #[arg(long, default_value_t = 100)] shrink_patience: usize,
         #[arg(long, default_value_t = 2.0)] growth_new_layer_ratio: f32,
         #[arg(long, default_value_t = 4)] growth_max_blocks: usize,
         #[arg(long, default_value_t = 3072)] growth_max_ff: usize,
