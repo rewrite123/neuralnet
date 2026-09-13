@@ -593,12 +593,12 @@ impl Model {
             for batch in sequences.chunks(batch_size) {
                 #[cfg(feature = "gpu")]
                 if crate::gpu::enabled() && batch.len() > 1 {
-                    if let Ok((loss, gradients)) = self.language_model_batch_step_cuda(batch) {
-                        total += loss * batch.len() as f32;
-                        optimizer.step += 1;
-                        self.apply_gradients(&gradients, learning_rate, &mut optimizer);
-                        continue;
-                    }
+                    let (loss, gradients) = self.language_model_batch_step_cuda(batch)
+                        .map_err(|error| format!("CUDA language-model microbatch failed: {error}"))?;
+                    total += loss * batch.len() as f32;
+                    optimizer.step += 1;
+                    self.apply_gradients(&gradients, learning_rate, &mut optimizer);
+                    continue;
                 }
                 let mut gradients: Option<Vec<Option<LayerGradient>>> = None;
                 for (tokens, targets) in batch {
