@@ -486,6 +486,14 @@ impl Model {
         let vocabulary = logits.width;
         if logits.height != tokens.len() { return Err("model output does not have one row per token".into()); }
 
+        #[cfg(feature = "gpu")]
+        if crate::gpu::enabled() {
+            if let Ok((loss, gradient_values)) = crate::gpu::softmax_cross_entropy(&logits.values, targets, tokens.len(), vocabulary) {
+                let gradient = Tensor::new(1, logits.height, vocabulary, gradient_values)?;
+                return Ok((loss, self.backward_traversal(&cache, gradient)?));
+            }
+        }
+
         let mut loss = 0.0;
         let mut gradient_values = vec![0.0; logits.values.len()];
         for position in 0..tokens.len() {

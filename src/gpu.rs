@@ -130,6 +130,21 @@ extern "C" __global__ void column_sum(const float* values, float* out, int rows,
     for (int row = 0; row < rows; ++row) sum += values[(size_t)row * columns + column];
     out[column] = sum;
 }
+extern "C" __global__ void softmax_cross_entropy(const float* logits, const float* targets, float* gradient, float* losses, int rows, int columns) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x; if (row >= rows) return;
+    const float* input = logits + (size_t)row * columns;
+    float* output = gradient + (size_t)row * columns;
+    float maximum = -3.402823466e+38f;
+    for (int column = 0; column < columns; ++column) maximum = fmaxf(maximum, input[column]);
+    float total = 0.0f;
+    for (int column = 0; column < columns; ++column) total += expf(input[column] - maximum);
+    int target = (int)targets[row];
+    for (int column = 0; column < columns; ++column) {
+        float probability = expf(input[column] - maximum) / total;
+        output[column] = (probability - (column == target ? 1.0f : 0.0f)) / rows;
+    }
+    losses[row] = -(input[target] - maximum - logf(total));
+}
 extern "C" __global__ void layer_norm_forward(const float* input, const float* gamma, const float* beta, float* out, float* hat, float* scale, int rows, int width) {
     int row = blockIdx.x * blockDim.x + threadIdx.x; if (row >= rows) return;
     const float* x = input + (size_t)row * width;
@@ -395,6 +410,25 @@ pub fn column_sum(values: &[f32], rows: usize, columns: usize) -> Result<Vec<f32
     let (rows_i32, columns_i32) = (rows as i32, columns as i32);
     launch_kernel!(&stream, &function, columns, &device_values, &mut output, &rows_i32, &columns_i32)?;
     stream.memcpy_dtov(&output).map_err(|error| error.to_string())
+}
+
+/// Computes mean next-token cross-entropy and its logits gradient on the device.
+pub fn softmax_cross_entropy(logits: &[f32], targets: &[u32], rows: usize, columns: usize) -> Result<(f32, Vec<f32>), String> {
+    if rows == 0 || columns == 0 || logits.len() != rows * columns || targets.len() != rows || targets.iter().any(|target| *target as usize >= columns) {
+        return Err("invalid CUDA softmax cross-entropy shape or target".into());
+    }
+    let (context, module) = cnn_runtime()?;
+    let stream = context.default_stream();
+    let function = module.load_function("softmax_cross_entropy").map_err(|error| error.to_string())?;
+    let device_logits = stream.memcpy_stod(logits).map_err(|error| error.to_string())?;
+    let target_values: Vec<f32> = targets.iter().map(|target| *target as f32).collect();
+    let device_targets = stream.memcpy_stod(&target_values).map_err(|error| error.to_string())?;
+    let mut gradient = stream.alloc_zeros::<f32>(logits.len()).map_err(|error| error.to_string())?;
+    let mut losses = stream.alloc_zeros::<f32>(rows).map_err(|error| error.to_string())?;
+    let (rows_i32, columns_i32) = (rows as i32, columns as i32);
+    launch_kernel!(&stream, &function, rows, &device_logits, &device_targets, &mut gradient, &mut losses, &rows_i32, &columns_i32)?;
+    let mean_loss = stream.memcpy_dtov(&losses).map_err(|error| error.to_string())?.iter().sum::<f32>() / rows as f32;
+    Ok((mean_loss, stream.memcpy_dtov(&gradient).map_err(|error| error.to_string())?))
 }
 
 /// Everything a transformer block needs while it stays on the device.
