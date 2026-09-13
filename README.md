@@ -10,6 +10,16 @@ cargo build --release
 
 Run the built executable as `target/release/neuralnet`, or use `cargo run --release -- <command>` while developing.
 
+### Deploy to deeplearn
+
+For the configured `deeplearn` SSH host, push the current committed `grownn` branch, update the remote checkout, and build the one-job CUDA release binary:
+
+```bash
+bash scripts/deploy_deeplearn.sh
+```
+
+Set `DEEPLEARN_HOST` or `DEEPLEARN_ROOT` to override the remote host or checkout path, or pass a branch name as the sole argument. The script does not stop or restart an active training process.
+
 ## Commands
 
 ### Create a model
