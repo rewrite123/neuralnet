@@ -56,6 +56,7 @@ enum Commands {
         #[arg(long, default_value_t = 64)] sequence: usize,
         #[arg(long, default_value_t = 1)] epochs: usize,
         #[arg(long, default_value_t = 0.0003)] learning_rate: f32,
+        #[arg(long, default_value_t = 1)] batch_size: usize,
         #[arg(long)] max_sequences: Option<usize>,
         #[arg(long, default_value_t = 64)] log_every: usize,
         #[arg(long, default_value_t = 0.1)] validation_fraction: f32,
@@ -203,7 +204,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             save_to(&built, &output)?;
             println!("Created {} model at {}", architecture.label(), output.display());
         }
-        Commands::TrainText { model, output, text, vocab, merges, sequence, epochs, learning_rate, max_sequences, log_every, validation_fraction, growth, growth_max_units, growth_trigger, growth_patience, shrink_trigger, shrink_patience, growth_new_layer_ratio, growth_max_blocks, growth_max_ff, growth_interval, cuda } => {
+        Commands::TrainText { model, output, text, vocab, merges, sequence, epochs, learning_rate, batch_size, max_sequences, log_every, validation_fraction, growth, growth_max_units, growth_trigger, growth_patience, shrink_trigger, shrink_patience, growth_new_layer_ratio, growth_max_blocks, growth_max_ff, growth_interval, cuda } => {
             enable_cuda(cuda)?;
             let mut network = model::load_model(&model).map_err(io::Error::other)?;
             let tokenizer = tokenizer::Tokenizer::load(&vocab, &merges).map_err(io::Error::other)?;
@@ -227,7 +228,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             'training: for epoch in 1..=epochs {
                 // Chunked so a long epoch reports progress and can grow as it goes.
                 for chunk in windows.chunks(log_every) {
-                    let loss = network.train_language_model(chunk, 1, learning_rate, learn_functions::LearningFunction::AdamW { weight_decay: 0.01 }, &interrupted, |_, _| {}).map_err(io::Error::other)?;
+                    let loss = network.train_language_model_batched(chunk, 1, batch_size, learning_rate, learn_functions::LearningFunction::AdamW { weight_decay: 0.01 }, &interrupted, |_, _| {}).map_err(io::Error::other)?;
                     steps += chunk.len();
                     let (validation_loss, validation_accuracy) = evaluate_sequences(&network, &validation).map_err(io::Error::other)?;
                     let elapsed = started.elapsed().as_secs_f32();

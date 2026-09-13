@@ -543,15 +543,30 @@ impl Model {
 
     /// Trains on `(tokens, next_tokens)` pairs, returning the mean loss of the final epoch.
     pub fn train_language_model(&mut self, sequences: &[(Vec<u32>, Vec<u32>)], epochs: usize, learning_rate: f32, function: LearningFunction, interrupted: &AtomicBool, mut progress: impl FnMut(usize, f32)) -> Result<f32, String> {
-        if sequences.is_empty() { return Err("no training sequences".into()); }
+        self.train_language_model_batched(sequences, epochs, 1, learning_rate, function, interrupted, progress)
+    }
+
+    /// Trains on fixed-length token sequences in microbatches.
+    ///
+    /// When CUDA is enabled, compatible gradients remain resident on the device while they are
+    /// accumulated. This reduces optimizer launches and host/device transfers without changing
+    /// the single-sequence behavior used by the existing API.
+    pub fn train_language_model_batched(&mut self, sequences: &[(Vec<u32>, Vec<u32>)], epochs: usize, batch_size: usize, learning_rate: f32, function: LearningFunction, interrupted: &AtomicBool, mut progress: impl FnMut(usize, f32)) -> Result<f32, String> {
+        if sequences.is_empty() || batch_size == 0 { return Err("language-model sequences and batch size must be non-zero".into()); }
         let mut optimizer = self.take_optimizer(function);
         let mut last = 0.0;
         for epoch in 1..=epochs {
             if interrupted.load(Ordering::Relaxed) { break; }
             let mut total = 0.0;
-            for (tokens, targets) in sequences {
-                let (loss, gradients) = self.language_model_step(tokens, targets)?;
-                total += loss;
+            for batch in sequences.chunks(batch_size) {
+                let mut gradients: Option<Vec<Option<LayerGradient>>> = None;
+                for (tokens, targets) in batch {
+                    let (loss, sample) = self.language_model_step(tokens, targets)?;
+                    total += loss;
+                    if let Some(total) = gradients.as_mut() { add_gradients(total, &sample); } else { gradients = Some(sample); }
+                }
+                let mut gradients = gradients.expect("non-empty batch has gradients");
+                if batch.len() > 1 { scale_gradients(&mut gradients, 1.0 / batch.len() as f32); }
                 optimizer.step += 1;
                 self.apply_gradients(&gradients, learning_rate, &mut optimizer);
             }
@@ -1742,10 +1757,10 @@ mod tests {
         let mut model = Model::language_model(7, 16, 2, 32, 2, 8).unwrap();
         let tokens = vec![1u32, 2, 3, 4, 5, 6];
         let targets = vec![2u32, 3, 4, 5, 6, 1];
-        let sequences = vec![(tokens.clone(), targets.clone())];
+        let sequences = vec![(tokens.clone(), targets.clone()), (tokens.clone(), targets.clone())];
         let interrupted = AtomicBool::new(false);
         let before = model.language_model_step(&tokens, &targets).unwrap().0;
-        let after = model.train_language_model(&sequences, 220, 0.01, LearningFunction::AdamW { weight_decay: 0.0 }, &interrupted, |_, _| {}).unwrap();
+        let after = model.train_language_model_batched(&sequences, 220, 2, 0.01, LearningFunction::AdamW { weight_decay: 0.0 }, &interrupted, |_, _| {}).unwrap();
         assert!(after < before * 0.2, "loss did not fall enough: {before} -> {after}");
         assert_eq!(model.generate(&[1], 5, 8).unwrap(), vec![1, 2, 3, 4, 5, 6]);
     }
