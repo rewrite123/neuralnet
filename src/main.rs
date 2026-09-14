@@ -61,6 +61,8 @@ enum Commands {
         #[arg(long, default_value_t = 1)] checkpoint_every: usize,
         #[arg(long)] max_sequences: Option<usize>,
         #[arg(long, default_value_t = 64)] log_every: usize,
+        /// Separate corpus used only for held-out validation; it is never included in training.
+        #[arg(long)] validation_text: Option<PathBuf>,
         #[arg(long, default_value_t = 0.1)] validation_fraction: f32,
         #[arg(long, value_enum)] growth: Option<growth::GrowthStrategy>,
         #[arg(long, default_value_t = 256)] growth_max_units: usize,
@@ -208,7 +210,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             save_to(&built, &output)?;
             println!("Created {} model at {}", architecture.label(), output.display());
         }
-        Commands::TrainText { model, output, text, vocab, merges, sequence, epochs, learning_rate, batch_size, checkpoint_every, max_sequences, log_every, validation_fraction, growth, growth_max_units, growth_trigger, growth_patience, shrink_trigger, shrink_patience, growth_new_layer_ratio, growth_max_blocks, growth_max_ff, growth_interval, cuda } => {
+        Commands::TrainText { model, output, text, vocab, merges, sequence, epochs, learning_rate, batch_size, checkpoint_every, max_sequences, log_every, validation_text, validation_fraction, growth, growth_max_units, growth_trigger, growth_patience, shrink_trigger, shrink_patience, growth_new_layer_ratio, growth_max_blocks, growth_max_ff, growth_interval, cuda } => {
             enable_cuda(cuda)?;
             let mut network = model::load_model(&model).map_err(io::Error::other)?;
             let output = output.unwrap_or(model);
@@ -216,13 +218,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             let corpus = fs::read_to_string(&text)?;
             let ids = tokenizer.encode(&corpus).map_err(io::Error::other)?;
             if ids.len() < sequence + 1 { return Err(format!("corpus has {} tokens, need at least {}", ids.len(), sequence + 1).into()); }
-            let mut windows: Vec<(Vec<u32>, Vec<u32>)> = ids.windows(sequence + 1).step_by(sequence).map(|window| (window[..sequence].to_vec(), window[1..].to_vec())).collect();
+            let mut windows = text_windows(&ids, sequence);
+            let validation = match validation_text {
+                Some(path) => {
+                    let validation_ids = tokenizer.encode(&fs::read_to_string(&path)?).map_err(io::Error::other)?;
+                    let validation = text_windows(&validation_ids, sequence);
+                    if validation.is_empty() { return Err(format!("validation corpus has {} tokens, need at least {}", validation_ids.len(), sequence + 1).into()); }
+                    println!("Using separate held-out validation corpus: {}", path.display());
+                    validation
+                }
+                None => split_validation_tail(&mut windows, validation_fraction)?,
+            };
             windows.shuffle(&mut rand::rng());
             if let Some(limit) = max_sequences { windows.truncate(limit); }
-            // Held out before any training so growth strategies are compared on unseen text; a
-            // bigger grown model would otherwise win simply by memorising more of the corpus.
-            let held_out = ((windows.len() as f32 * validation_fraction).round() as usize).clamp(1, windows.len().saturating_sub(1));
-            let validation = windows.split_off(windows.len() - held_out);
             println!("Training on {} tokens: {} training sequences, {} held-out, {sequence} tokens each", ids.len(), windows.len(), validation.len());
             let mut controller = growth.map(|strategy| growth::GrowthController::new(strategy, growth_max_units, growth_trigger, growth_patience, shrink_trigger, shrink_patience, growth_new_layer_ratio, growth_max_blocks, growth_max_ff, growth_interval));
             let interrupted = Arc::new(AtomicBool::new(false));
@@ -372,6 +380,17 @@ fn normalize_arguments(arguments: Vec<OsString>) -> Vec<OsString> {
     arguments.into_iter().map(|argument| if argument == "--train" { OsString::from("train") } else { argument }).collect()
 }
 
+fn text_windows(ids: &[u32], sequence: usize) -> Vec<(Vec<u32>, Vec<u32>)> {
+    ids.windows(sequence + 1).step_by(sequence).map(|window| (window[..sequence].to_vec(), window[1..].to_vec())).collect()
+}
+
+/// Reserves a stable tail of the corpus before the training windows are shuffled.
+fn split_validation_tail<T>(windows: &mut Vec<T>, fraction: f32) -> Result<Vec<T>, String> {
+    if !(0.0..1.0).contains(&fraction) || windows.len() < 2 { return Err("validation fraction must be in (0, 1) and leave at least one training sequence".into()); }
+    let held_out = ((windows.len() as f32 * fraction).round() as usize).clamp(1, windows.len() - 1);
+    Ok(windows.split_off(windows.len() - held_out))
+}
+
 /// Mean next-token loss and accuracy over held-out sequences.
 fn evaluate_sequences(network: &model::Model, sequences: &[(Vec<u32>, Vec<u32>)], batch_size: usize) -> Result<(f32, f32), String> {
     if sequences.is_empty() || batch_size == 0 { return Err("held-out sequences and batch size must be non-zero".into()); }
@@ -444,7 +463,7 @@ fn parse_neuron_indexes(value: &str) -> Result<Vec<usize>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_arguments, parse_neuron_indexes};
+    use super::{normalize_arguments, parse_neuron_indexes, split_validation_tail};
     use std::ffi::OsString;
 
     #[test]
@@ -463,6 +482,14 @@ mod tests {
     fn normalizes_train_flag_to_subcommand() {
         let arguments = normalize_arguments(vec![OsString::from("neuralnet"), OsString::from("--train"), OsString::from("--cuda")]);
         assert_eq!(arguments, vec![OsString::from("neuralnet"), OsString::from("train"), OsString::from("--cuda")]);
+    }
+
+    #[test]
+    fn reserves_the_same_tail_before_training_shuffle() {
+        let mut windows = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let validation = split_validation_tail(&mut windows, 0.2).unwrap();
+        assert_eq!(windows, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(validation, vec![8, 9]);
     }
 }
 

@@ -28,6 +28,10 @@ bash scripts/run_cuda.sh train-text --cuda --model models/atgt-shakespeare-delta
 
 The installed driver reports CUDA 13.0 support, while the system `nvcc` is CUDA 13.4; invoking `target/release/neuralnet` directly can therefore cause `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` and a CPU fallback in older binaries.
 
+### Stable Text Validation
+
+`train-text` reserves the final `--validation-fraction` of corpus windows before shuffling training windows, so restarts use the same held-out text. For a clean external evaluation set, pass `--validation-text <PATH>`; that corpus supplies validation windows only and is never included in training. This is recommended after an earlier run used changing random validation splits.
+
 ### Profile CUDA Training
 
 On `deeplearn`, run the arithmetic integration test to confirm that a real training process obtains a CUDA compute context while capturing CPU and GPU samples:
